@@ -1,0 +1,9 @@
+name: financial_data_lake
+channels:
+    - defaults
+    - conda-forge
+dependencies:
+    - python
+    - pandas
+    - numpy
+    - pip
