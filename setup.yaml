@@ -7,3 +7,5 @@ dependencies:
     - pandas
     - numpy
     - pip
+    - deltalake
+    - cryptography
