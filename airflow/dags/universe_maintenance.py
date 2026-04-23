@@ -1,8 +1,13 @@
-from airflow.sdk import dag, task, TaskGroup
-from airflow.providers.postgres.operators.postgres import PostgresOperator
+from airflow.sdk import dag, task
 from airflow.providers.standard.operators.empty import EmptyOperator
 
 from typing import List, Dict
+
+# Import client
+from src.db_client.db_client import DBClient
+
+# Import services
+from src.services.universe_service import UniverseService
 
 import uuid
 
@@ -11,14 +16,18 @@ default_args={
     'depends_on_past': False
 }
 
-@dag('Financial_Data_ETL', schedule='once', default_args=default_args,
+params={'pipeline_run_id': str(uuid.uuid4())}
+
+@dag('universe-maintenanace', schedule='once', default_args=default_args,
      catchup=False, tags=['financial_data_lake', 'ETL'], description='Extracting Data from Schwab',
-     params={'pipeline_run_id': str(uuid.uuid4())})
+     params=params)
 def universe_maintenance():
 
     @task
-    def log_pipeline_start():
-        pass
+    def log_pipeline_start() -> None:
+        client = DBClient
+        service = UniverseService(client, "universe-maintenanace", params.pipeline_run_id)
+        service.pipeline_start()
 
     @task
     def pull_symbol_from_csv():
@@ -59,8 +68,10 @@ def universe_maintenance():
     start = EmptyOperator(task_id='start')
     end = EmptyOperator(task_id='end')
 
+    log_pipeline_start_task = log_pipeline_start()
+
     my_universe = pull_symbol_from_csv()
 
-    start >> my_universe >> end
+    start >> log_pipeline_start_task >> my_universe >> end
 
 universe_maintenance()
