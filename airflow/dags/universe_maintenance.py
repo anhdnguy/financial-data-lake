@@ -70,8 +70,42 @@ def universe_maintenance():
 
     log_pipeline_start_task = log_pipeline_start()
 
-    my_universe = pull_symbol_from_csv()
+    pull_symbol_from_csv_task = pull_symbol_from_csv()
 
-    start >> log_pipeline_start_task >> my_universe >> end
+    sanitize_task = sanitize()
+
+    query_active_symbols_task = query_active_symbols()
+
+    diff_symbols_task = diff_symbols()
+
+    upsert_membership_task = upsert_membership()
+
+    upsert_universe_membership_task = upsert_universe_membership()
+
+    update_exit_date_task = update_exit_date()
+
+    log_delisted_task = log_delisted()
+
+    log_pipeline_end_task = log_pipeline_end()
+
+    # Extract tickers
+    start >> log_pipeline_start_task >> pull_symbol_from_csv_task
+    pull_symbol_from_csv_task >> sanitize_task >> query_active_symbols_task
+    query_active_symbols_task >> diff_symbols_task
+
+    # Extract new or delisted tickers
+    diff_symbols_task >> [upsert_membership_task, update_exit_date_task]
+
+    # Process new tickers
+    upsert_membership_task >> upsert_universe_membership_task
+
+    # Process delisted tickers
+    update_exit_date_task >> log_delisted_task
+
+    # Final chain
+    [upsert_universe_membership_task, log_delisted_task] >> log_pipeline_end_task
+
+    log_pipeline_end_task >> end
+
 
 universe_maintenance()
