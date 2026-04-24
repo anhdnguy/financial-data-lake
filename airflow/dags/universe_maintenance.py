@@ -1,4 +1,4 @@
-from airflow.sdk import dag, task
+from airflow.sdk import dag, task, Variable
 from airflow.providers.standard.operators.empty import EmptyOperator
 
 from typing import List, Dict
@@ -9,6 +9,9 @@ from src.db_client.db_client import DBClient
 # Import services
 from src.services.universe_service import UniverseService
 
+# Import config
+from src.config import AppConfig
+
 import uuid
 
 default_args={
@@ -16,17 +19,17 @@ default_args={
     'depends_on_past': False
 }
 
-params={'pipeline_run_id': str(uuid.uuid4())}
-
-@dag('universe-maintenanace', schedule='once', default_args=default_args,
-     catchup=False, tags=['financial_data_lake', 'ETL'], description='Extracting Data from Schwab',
-     params=params)
+@dag('universe-maintenance', schedule='once', default_args=default_args,
+     catchup=False, tags=['financial_data_lake', 'ETL'], description='Extracting Data from Schwab')
 def universe_maintenance():
 
     @task
-    def log_pipeline_start() -> None:
-        client = DBClient
-        service = UniverseService(client, "universe-maintenanace", params.pipeline_run_id)
+    def log_pipeline_start(**context) -> None:
+        pipeline_run_id = str(uuid.uuid4())
+        Variable.set("pipeline_run_id", pipeline_run_id)
+        config = AppConfig()
+        client = DBClient(config)
+        service = UniverseService(client, context["task_instance"]["dag_id"], pipeline_run_id)
         service.pipeline_start()
 
     @task
