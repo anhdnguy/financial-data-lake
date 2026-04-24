@@ -1,5 +1,4 @@
 import psycopg2
-from psycopg2.extras import execute_values
 from src.config import AppConfig
 
 from src.db_client.db_execption import (
@@ -35,7 +34,7 @@ class DBClient:
         
     def _insert(self, query: str, data: tuple) -> None:
         try:
-            execute_values(self.cursor, query, data)
+            self.cursor.execute(f"{query} VALUES{data}")
             self.connection.commit()
 
         except psycopg2.Error as e:
@@ -54,6 +53,6 @@ class DBClient:
 
 
     def log_pipeline_run(self, query: str, data: tuple):
-        self.connect_to_db()
+        self._connect_to_db()
         self._insert(query, data)
         self._close_connection()
