@@ -32,7 +32,7 @@ class DBClient:
         if self.connection:
             self.connection.close()
         
-    def _insert(self, query: str, data: tuple) -> None:
+    def _insert(self, query: str, data: list) -> None:
         try:
             self.cursor.execute(f"{query} VALUES{data}")
             self.connection.commit()
@@ -42,7 +42,16 @@ class DBClient:
             print(f"Error message: {e.diag.message_primary}")
             print(f"SQL state: {e.diag.sqlstate}")
             print(f"Error position: {e.diag.statement_position}")
-            raise DBError("Error") from e
+            raise DBError("Insert failed") from e
+        
+    def _upsert(self, query: str, data: list) -> None:
+        try:
+            self.cursor.execute(f"{query} VALUES{data}")
+            self.connection.commit()
+
+        except psycopg2.Error as e:
+            self.connection.rollback()
+            raise DBError("Upsert failed") from e
 
 
     def _update(self):
