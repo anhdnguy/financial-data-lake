@@ -64,9 +64,16 @@ class DBClient:
     def _update(self):
         pass
 
-    def _select(self):
-        pass
+    def _select(self, query: str):
+        try:
+            self.cursor.execute(query)
+            rows = self.cursor.fetchall()
+            self.connection.commit()
+            return rows
 
+        except psycopg2.Error as e:
+            raise DBError("Select failed") from e
 
     def log_pipeline_run(self, query: str, data: tuple):
         self._insert(query, data)
+
