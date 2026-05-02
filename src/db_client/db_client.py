@@ -1,4 +1,5 @@
 import psycopg2
+from psycopg2.extras import execute_values
 from src.config import AppConfig
 
 from src.db_client.db_execption import (
@@ -53,7 +54,7 @@ class DBClient:
         
     def _upsert(self, query: str, data: list) -> None:
         try:
-            self.cursor.execute(f"{query} VALUES{data}")
+            execute_values(self.cursor, query, data)
             self.connection.commit()
 
         except psycopg2.Error as e:
@@ -61,10 +62,16 @@ class DBClient:
             raise DBError("Upsert failed") from e
 
 
-    def _update(self):
-        pass
+    def _update(self, query: str):
+        try:
+            self.cursor.execute(query)
+            self.connection.commit()
+        
+        except psycopg2.Error as e:
+            self.connection.rollback()
+            raise DBError("Update failed") from e
 
-    def _select(self, query: str):
+    def _select(self, query: str) -> list[tuple]:
         try:
             self.cursor.execute(query)
             rows = self.cursor.fetchall()
@@ -73,7 +80,3 @@ class DBClient:
 
         except psycopg2.Error as e:
             raise DBError("Select failed") from e
-
-    def log_pipeline_run(self, query: str, data: tuple):
-        self._insert(query, data)
-
