@@ -33,11 +33,15 @@ def universe_maintenance():
         service.pipeline_start()
 
     @task
-    def pull_symbol_from_csv():
-        pass
+    def pull_symbol_from_csv(**context) -> Dict[str, List]:
+        pipeline_run_id = Variable.get("pipeline_run_id")
+        config = AppConfig()
+        client = DBClient(config)
+        service = UniverseService(client, context["task_instance"]["dag_id"], pipeline_run_id)
+        return service.pull_symbol()    
 
     @task
-    def sanitize():
+    def sanitize(symbol_lists: Dict[str, List]):
         pass
 
     @task
