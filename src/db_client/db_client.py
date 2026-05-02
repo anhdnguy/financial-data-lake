@@ -31,8 +31,15 @@ class DBClient:
         
         if self.connection:
             self.connection.close()
+
+    def __enter__(self):
+        self._connect_to_db()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._close_connection()
         
-    def _insert(self, query: str, data: list) -> None:
+    def _insert(self, query: str, data: tuple) -> None:
         try:
             self.cursor.execute(f"{query} VALUES{data}")
             self.connection.commit()
@@ -62,6 +69,4 @@ class DBClient:
 
 
     def log_pipeline_run(self, query: str, data: tuple):
-        self._connect_to_db()
         self._insert(query, data)
-        self._close_connection()

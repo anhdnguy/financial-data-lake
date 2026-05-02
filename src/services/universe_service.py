@@ -21,4 +21,5 @@ class UniverseService:
 
         data = (self.pipeline_run_id, self.dag_id, _today, "RUNNING")
 
-        self.client.log_pipeline_run(query, data)
+        with self.client:
+            self.client.log_pipeline_run(query, data)
