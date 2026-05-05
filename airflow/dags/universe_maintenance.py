@@ -47,7 +47,7 @@ def universe_maintenance():
         config = AppConfig()
         client = DBClient(config)
         service = UniverseService(client, "universe_maintenance", pipeline_run_id)
-        return service.sanitize_symbol
+        return service.sanitize_symbol(symbol_lists)
 
     @task
     def query_active_symbols():
