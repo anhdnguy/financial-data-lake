@@ -74,9 +74,9 @@ class DBClient:
             self.connection.rollback()
             raise DBError(f"Update failed: {str(e)}") from e
 
-    def _select(self, query: str) -> list[tuple]:
+    def _select(self, query: str, data: tuple = None) -> list[tuple]:
         try:
-            self.cursor.execute(query)
+            self.cursor.execute(query, data)
             rows = self.cursor.fetchall()
             self.connection.commit()
             return rows
