@@ -19,7 +19,7 @@ default_args={
     'depends_on_past': False
 }
 
-@dag('universe-maintenance', schedule='once', default_args=default_args,
+@dag('universe_maintenance', schedule='once', default_args=default_args,
      catchup=False, tags=['financial_data_lake', 'ETL'], description='Extracting Data from Schwab')
 def universe_maintenance():
 
@@ -29,15 +29,16 @@ def universe_maintenance():
         Variable.set("pipeline_run_id", pipeline_run_id)
         config = AppConfig()
         client = DBClient(config)
-        service = UniverseService(client, context["task_instance"]["dag_id"], pipeline_run_id)
-        service.pipeline_start()
+
+        with UniverseService(client, "universe_maintenance", pipeline_run_id) as service:
+            service.pipeline_start()
 
     @task
     def pull_symbol_from_csv(**context) -> Dict[str, List]:
         pipeline_run_id = Variable.get("pipeline_run_id")
         config = AppConfig()
         client = DBClient(config)
-        service = UniverseService(client, context["task_instance"]["dag_id"], pipeline_run_id)
+        service = UniverseService(client, "universe_maintenance", pipeline_run_id)
         return service.pull_symbol()    
 
     @task

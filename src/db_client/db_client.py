@@ -44,6 +44,9 @@ class DBClient:
         return False
         
     def _insert(self, query: str, data: tuple) -> None:
+        if not self.connection or self.connection.closed:
+            raise DBError("No active connection")
+        
         try:
             self.cursor.execute(query, data)
             self.connection.commit()
@@ -56,6 +59,9 @@ class DBClient:
             raise DBError(f"Insert failed: {str(e)}") from e
         
     def _upsert(self, query: str, data: list) -> None:
+        if not self.connection or self.connection.closed:
+            raise DBError("No active connection")
+        
         try:
             execute_values(self.cursor, query, data)
             self.connection.commit()
@@ -66,6 +72,9 @@ class DBClient:
 
 
     def _update(self, query: str, data: tuple) -> None:
+        if not self.connection or self.connection.closed:
+            raise DBError("No active connection")
+        
         try:
             self.cursor.execute(query, data)
             self.connection.commit()
@@ -75,6 +84,9 @@ class DBClient:
             raise DBError(f"Update failed: {str(e)}") from e
 
     def _select(self, query: str, data: tuple = None) -> list[tuple]:
+        if not self.connection or self.connection.closed:
+            raise DBError("No active connection")
+        
         try:
             self.cursor.execute(query, data)
             rows = self.cursor.fetchall()

@@ -10,6 +10,16 @@ class UniverseService:
         self.pipeline_run_id = pipeline_run_id
         self.dag_id = dag_id
 
+    def __enter__(self):
+        self.client._connect_to_db()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            self.client.connection.rollback()
+        self.client._close_connection()
+        return False
+
     def pipeline_start(self):
         query = """
             INSERT INTO pipeline_run (
@@ -21,8 +31,7 @@ class UniverseService:
 
         data = (self.pipeline_run_id, self.dag_id, _today, "RUNNING")
 
-        with self.client:
-            self.client._insert(query, data)
+        self.client._insert(query, data)
 
     def pull_symbol(self):
         csv_dir = "../../stock_csv/tickers.csv"
