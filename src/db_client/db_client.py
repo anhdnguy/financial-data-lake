@@ -2,7 +2,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 from src.config import AppConfig
 
-from src.db_client.db_execption import (
+from db_client.db_exception import (
     DBError
 )
 

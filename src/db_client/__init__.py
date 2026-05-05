@@ -1,5 +1,5 @@
 from .db_client import DBClient
-from .db_execption import (
+from .db_exception import (
     DBError
 )
 
