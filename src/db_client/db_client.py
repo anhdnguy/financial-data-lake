@@ -42,7 +42,7 @@ class DBClient:
         
     def _insert(self, query: str, data: tuple) -> None:
         try:
-            self.cursor.execute(f"{query} VALUES{data}")
+            self.cursor.execute(query, data)
             self.connection.commit()
 
         except psycopg2.Error as e:
@@ -50,7 +50,7 @@ class DBClient:
             print(f"Error message: {e.diag.message_primary}")
             print(f"SQL state: {e.diag.sqlstate}")
             print(f"Error position: {e.diag.statement_position}")
-            raise DBError("Insert failed") from e
+            raise DBError(f"Insert failed: {str(e)}") from e
         
     def _upsert(self, query: str, data: list) -> None:
         try:
@@ -59,17 +59,17 @@ class DBClient:
 
         except psycopg2.Error as e:
             self.connection.rollback()
-            raise DBError("Upsert failed") from e
+            raise DBError(f"Upsert failed: {str(e)}") from e
 
 
-    def _update(self, query: str):
+    def _update(self, query: str, data: tuple) -> None:
         try:
-            self.cursor.execute(query)
+            self.cursor.execute(query, data)
             self.connection.commit()
         
         except psycopg2.Error as e:
             self.connection.rollback()
-            raise DBError("Update failed") from e
+            raise DBError(f"Update failed: {str(e)}") from e
 
     def _select(self, query: str) -> list[tuple]:
         try:
@@ -79,4 +79,4 @@ class DBClient:
             return rows
 
         except psycopg2.Error as e:
-            raise DBError("Select failed") from e
+            raise DBError(f"Select failed: {str(e)}") from e

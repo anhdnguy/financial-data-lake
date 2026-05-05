@@ -14,7 +14,7 @@ class UniverseService:
         query = """
             INSERT INTO pipeline_run (
                 id, dag_id, run_date, status
-            ) VALUES %s
+            ) VALUES (%s, %s, %s, %s)
         """
 
         _today = _get_today()
