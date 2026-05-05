@@ -24,7 +24,7 @@ class DBClient:
             self.cursor = self.connection.cursor()
         
         except psycopg2.Error as e:
-            raise DBError("Error") from e
+            raise DBError(f"Connection failed: {str(e)}") from e
         
     def _close_connection(self) -> None:
         if self.cursor:
