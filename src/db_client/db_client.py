@@ -38,7 +38,10 @@ class DBClient:
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            self.connection.rollback()
         self._close_connection()
+        return False
         
     def _insert(self, query: str, data: tuple) -> None:
         try:
