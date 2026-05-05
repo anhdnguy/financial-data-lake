@@ -1,8 +1,11 @@
 import csv
+from typing import List, Dict
 
 from src.db_client.db_client import DBClient
 
-from src.transform.universe_transform import _get_today, _convert_list_to_dict
+from src.transform.universe_transform import (
+    _get_today, _convert_list_to_dict, _sanitize_symbol
+)
 
 class UniverseService:
     def __init__(self, client: DBClient, dag_id: str, pipeline_run_id: str):
@@ -17,6 +20,8 @@ class UniverseService:
     def __exit__(self, exc_type, exc, tb):
         if exc_type is not None:
             self.client.connection.rollback()
+        else:
+            self.client.connection.commit()
         self.client._close_connection()
         return False
 
@@ -42,5 +47,8 @@ class UniverseService:
         dict_tickers = _convert_list_to_dict(list_tickers)
         return dict_tickers
 
-    def sanitize_symbol(self):
-        pass
+    def sanitize_symbol(self, symbol_lists: Dict[str, List]):
+        """
+        Ex: {<universe_id>: ["ticker1", "ticker2"]}
+        """
+        return _sanitize_symbol(symbol_lists)

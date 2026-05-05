@@ -49,7 +49,6 @@ class DBClient:
         
         try:
             self.cursor.execute(query, data)
-            self.connection.commit()
 
         except psycopg2.Error as e:
             self.connection.rollback()
@@ -64,7 +63,6 @@ class DBClient:
         
         try:
             execute_values(self.cursor, query, data)
-            self.connection.commit()
 
         except psycopg2.Error as e:
             self.connection.rollback()
@@ -77,7 +75,6 @@ class DBClient:
         
         try:
             self.cursor.execute(query, data)
-            self.connection.commit()
         
         except psycopg2.Error as e:
             self.connection.rollback()
@@ -90,7 +87,6 @@ class DBClient:
         try:
             self.cursor.execute(query, data)
             rows = self.cursor.fetchall()
-            self.connection.commit()
             return rows
 
         except psycopg2.Error as e:

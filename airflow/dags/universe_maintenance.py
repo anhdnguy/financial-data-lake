@@ -24,7 +24,7 @@ default_args={
 def universe_maintenance():
 
     @task
-    def log_pipeline_start(**context) -> None:
+    def log_pipeline_start() -> None:
         pipeline_run_id = str(uuid.uuid4())
         Variable.set("pipeline_run_id", pipeline_run_id)
         config = AppConfig()
@@ -34,7 +34,7 @@ def universe_maintenance():
             service.pipeline_start()
 
     @task
-    def pull_symbol_from_csv(**context) -> Dict[str, List]:
+    def pull_symbol_from_csv() -> Dict[str, List]:
         pipeline_run_id = Variable.get("pipeline_run_id")
         config = AppConfig()
         client = DBClient(config)
@@ -43,7 +43,11 @@ def universe_maintenance():
 
     @task
     def sanitize(symbol_lists: Dict[str, List]):
-        pass
+        pipeline_run_id = Variable.get("pipeline_run_id")
+        config = AppConfig()
+        client = DBClient(config)
+        service = UniverseService(client, "universe_maintenance", pipeline_run_id)
+        return service.sanitize_symbol
 
     @task
     def query_active_symbols():
