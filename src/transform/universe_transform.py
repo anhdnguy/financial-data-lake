@@ -1,6 +1,6 @@
 from datetime import datetime
 import re
-from typing import List, Dict
+from typing import List, Dict, Any
 
 def _get_today():
     now = datetime.now()
@@ -25,3 +25,17 @@ def _sanitize_symbol(symbol_list: Dict[str, List]) -> Dict[str, List]:
         symbol_list[universe] = [re.sub(r'[^a-zA-Z0-9\s]', '.', symbol) for symbol in symbol_list[universe]]
     
     return symbol_list
+
+def _convert_tuple_to_list(data: Any) -> List:
+    result = []
+    for item in data:
+        if isinstance(item, tuple):
+            result.extend(list(item))
+        elif isinstance(item, list):
+            result.extend(item)
+        elif isinstance(item, str):
+            result.append(item)
+        else:
+            raise "Unknown type"
+    
+    return result

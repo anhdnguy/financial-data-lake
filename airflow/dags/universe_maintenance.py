@@ -39,7 +39,7 @@ def universe_maintenance():
         config = AppConfig()
         client = DBClient(config)
         service = UniverseService(client, "universe_maintenance", pipeline_run_id)
-        return service.pull_symbol()    
+        return service.pull_symbol()
 
     @task
     def sanitize(symbol_lists: Dict[str, List]):
@@ -51,7 +51,12 @@ def universe_maintenance():
 
     @task
     def query_active_symbols():
-        pass
+        pipeline_run_id = Variable.get("pipeline_run_id")
+        config = AppConfig()
+        client = DBClient(config)
+
+        with UniverseService(client, "universe_maintenance", pipeline_run_id) as service:
+            service.query_symbols()
 
     @task
     def diff_symbols():
@@ -84,7 +89,7 @@ def universe_maintenance():
 
     pull_symbol_from_csv_task = pull_symbol_from_csv()
 
-    sanitize_task = sanitize()
+    sanitize_task = sanitize(pull_symbol_from_csv_task)
 
     query_active_symbols_task = query_active_symbols()
 

@@ -4,7 +4,8 @@ from typing import List, Dict
 from src.db_client.db_client import DBClient
 
 from src.transform.universe_transform import (
-    _get_today, _convert_list_to_dict, _sanitize_symbol
+    _get_today, _convert_list_to_dict, _sanitize_symbol,
+    _convert_tuple_to_list
 )
 
 class UniverseService:
@@ -52,3 +53,15 @@ class UniverseService:
         Ex: {<universe_id>: ["ticker1", "ticker2"]}
         """
         return _sanitize_symbol(symbol_lists)
+    
+    def query_symbols(self, symbol_lists: Dict[str, List]):
+        active_symbols = {"import": symbol_lists}
+        for key in symbol_lists:
+            query = f"""
+                SELECT m.symbol FROM universe_membership um
+                JOIN membership m ON um.membership_id = m.id
+                WHERE um.universe_id = {key} AND um.exit_date IS NULL
+            """
+
+            temp = self.client._select(query)
+            active_symbols["query"][key] = _convert_tuple_to_list(temp)
