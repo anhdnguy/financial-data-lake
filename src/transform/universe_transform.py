@@ -29,13 +29,26 @@ def _sanitize_symbol(symbol_list: Dict[str, List]) -> Dict[str, List]:
 def _convert_tuple_to_list(data: Any) -> List:
     result = []
     for item in data:
-        if isinstance(item, tuple):
+        if isinstance(item, tuple) or isinstance(item, list):
             result.extend(list(item))
-        elif isinstance(item, list):
-            result.extend(item)
         elif isinstance(item, str):
             result.append(item)
         else:
-            raise "Unknown type"
+            raise ValueError(f"Unknown type: {type(item)}")
+    
+    return result
+
+def _sort_delisted_from_active(dict_symbols: Dict[Dict[str, List]]):
+    result = {}
+
+    _query = dict_symbols["query"]
+    _import = dict_symbols["import"]
+
+    query_set = set(_query[universe])
+    import_set = set(_import[universe])
+
+    for universe in _import:
+        result[universe]["new_symbols"] = list(import_set - query_set)
+        result[universe]["delisted_symbols"] = list(query_set - import_set)
     
     return result

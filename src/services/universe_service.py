@@ -5,7 +5,7 @@ from src.db_client.db_client import DBClient
 
 from src.transform.universe_transform import (
     _get_today, _convert_list_to_dict, _sanitize_symbol,
-    _convert_tuple_to_list
+    _convert_tuple_to_list, _sort_delisted_from_active
 )
 
 class UniverseService:
@@ -65,3 +65,11 @@ class UniverseService:
 
             temp = self.client._select(query)
             active_symbols["query"][key] = _convert_tuple_to_list(temp)
+
+        return active_symbols
+    
+    def diff_query_import(self, dict_symbols: Dict[Dict[str, List]]):
+        """
+        Input: {"import": {"<universe_id>": []}, "query": {"<universe_id>": []}}
+        """
+        return _sort_delisted_from_active(dict_symbols)
