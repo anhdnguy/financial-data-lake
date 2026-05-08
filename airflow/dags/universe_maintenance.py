@@ -9,9 +9,6 @@ from src.db_client.db_client import DBClient
 # Import services
 from src.services.universe_service import UniverseService
 
-# Import config
-from src.config import AppConfig
-
 # Import bootstrap helper
 from src.utilities.bootstrap import get_service
 
