@@ -64,6 +64,7 @@ def universe_maintenance():
 
     @task
     def upsert_membership():
+        "hello"
         pass
 
     @task
