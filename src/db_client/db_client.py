@@ -2,7 +2,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 from src.config import AppConfig
 
-from db_client.db_exception import (
+from src.db_client.db_exception import (
     DBError
 )
 
@@ -12,7 +12,7 @@ class DBClient:
         self.connection = None
         self.cursor = None
 
-    def _connect_to_db(self) -> None:
+    def __enter__(self):
         try:
             self.connection = psycopg2.connect(
                 database=self.config.db_name,
@@ -22,26 +22,24 @@ class DBClient:
                 port="5432"
             )
             self.cursor = self.connection.cursor()
+            return self
         
         except psycopg2.Error as e:
             raise DBError(f"Connection failed: {str(e)}") from e
-        
-    def _close_connection(self) -> None:
+
+    def __exit__(self, exc_type, exc, tb):
         if self.cursor:
             self.cursor.close()
         
         if self.connection:
             self.connection.close()
-
-    def __enter__(self):
-        self._connect_to_db()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if exc_type is not None:
-            self.connection.rollback()
-        self._close_connection()
         return False
+    
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
         
     def _insert(self, query: str, data: tuple) -> None:
         if not self.connection or self.connection.closed:
@@ -51,7 +49,7 @@ class DBClient:
             self.cursor.execute(query, data)
 
         except psycopg2.Error as e:
-            self.connection.rollback()
+            self.rollback()
             print(f"Error message: {e.diag.message_primary}")
             print(f"SQL state: {e.diag.sqlstate}")
             print(f"Error position: {e.diag.statement_position}")
@@ -65,7 +63,7 @@ class DBClient:
             execute_values(self.cursor, query, data)
 
         except psycopg2.Error as e:
-            self.connection.rollback()
+            self.rollback()
             raise DBError(f"Upsert failed: {str(e)}") from e
 
 
@@ -77,7 +75,7 @@ class DBClient:
             self.cursor.execute(query, data)
         
         except psycopg2.Error as e:
-            self.connection.rollback()
+            self.rollback()
             raise DBError(f"Update failed: {str(e)}") from e
 
     def _select(self, query: str, data: tuple = None) -> list[tuple]:
