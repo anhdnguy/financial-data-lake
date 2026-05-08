@@ -1,4 +1,5 @@
 import csv
+from pathlib import Path
 from typing import List, Dict
 
 from src.db_client.db_client import DBClient
@@ -15,15 +16,15 @@ class UniverseService:
         self.dag_id = dag_id
 
     def __enter__(self):
-        self.client._connect_to_db()
+        self.client.__enter__()
         return self
 
     def __exit__(self, exc_type, exc, tb):
         if exc_type is not None:
-            self.client.connection.rollback()
+            self.client.rollback()
         else:
-            self.client.connection.commit()
-        self.client._close_connection()
+            self.client.commit()
+        self.client.__exit__(exc_type, exc, tb)
         return False
 
     def pipeline_start(self):
@@ -40,7 +41,7 @@ class UniverseService:
         self.client._insert(query, data)
 
     def pull_symbol(self):
-        csv_dir = "../../stock_csv/tickers.csv"
+        csv_dir = Path(__file__).parent.parent.parent / "stock_csv" / "tickers.csv"
         with open(csv_dir, 'r') as file:
             reader = csv.DictReader(file)
             list_tickers = [row for row in reader]
@@ -56,14 +57,15 @@ class UniverseService:
     
     def query_symbols(self, symbol_lists: Dict[str, List]):
         active_symbols = {"import": symbol_lists}
+        active_symbols["query"] = {}
         for key in symbol_lists:
-            query = f"""
+            query = """
                 SELECT m.symbol FROM universe_membership um
                 JOIN membership m ON um.membership_id = m.id
-                WHERE um.universe_id = {key} AND um.exit_date IS NULL
+                WHERE um.universe_id = %s AND um.exit_date IS NULL
             """
 
-            temp = self.client._select(query)
+            temp = self.client._select(query, (key,))
             active_symbols["query"][key] = _convert_tuple_to_list(temp)
 
         return active_symbols

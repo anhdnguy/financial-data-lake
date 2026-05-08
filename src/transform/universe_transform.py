@@ -44,10 +44,10 @@ def _sort_delisted_from_active(dict_symbols: Dict[Dict[str, List]]):
     _query = dict_symbols["query"]
     _import = dict_symbols["import"]
 
-    query_set = set(_query[universe])
-    import_set = set(_import[universe])
-
     for universe in _import:
+        query_set = set(_query[universe])
+        import_set = set(_import[universe])
+        result[universe] = {}
         result[universe]["new_symbols"] = list(import_set - query_set)
         result[universe]["delisted_symbols"] = list(query_set - import_set)
     
