@@ -6,7 +6,8 @@ from src.db_client.db_client import DBClient
 
 from src.transform.universe_transform import (
     _get_today, _convert_list_to_dict, _sanitize_symbol,
-    _convert_tuple_to_list, _sort_delisted_from_active
+    _convert_tuple_to_list, _sort_delisted_from_active,
+    _add_today_to_tuple
 )
 
 class UniverseService:
@@ -48,12 +49,6 @@ class UniverseService:
         
         dict_tickers = _convert_list_to_dict(list_tickers)
         return dict_tickers
-
-    def sanitize_symbol(self, symbol_lists: Dict[str, List]):
-        """
-        Ex: {<universe_id>: ["ticker1", "ticker2"]}
-        """
-        return _sanitize_symbol(symbol_lists)
     
     def query_symbols(self, symbol_lists: Dict[str, List]):
         active_symbols = {"import": symbol_lists}
@@ -69,9 +64,25 @@ class UniverseService:
             active_symbols["query"][key] = _convert_tuple_to_list(temp)
 
         return active_symbols
-    
-    def diff_query_import(self, dict_symbols: Dict[Dict[str, List]]):
+
+    def upsert_membership_universe(self, current_delisted_symbols: Dict[str, Dict[str, List]]):
+        query_upsert_membership = """
+            INSERT INTO membership (symbol)
+            VALUES %s ON CONFLICT (symbol) DO UPDATE SET
+                symbol = EXCLUDED.symbol
         """
-        Input: {"import": {"<universe_id>": []}, "query": {"<universe_id>": []}}
+        query_select_membership = """
+            SELECT id FROM membership WHERE updated_at = %s
         """
-        return _sort_delisted_from_active(dict_symbols)
+        query_upsert_universe_membership = """
+            INSERT INTO univese_membersip (membership_id, universe_id)
+            VALUES %s ON CONFLICT (membership_id) DO UPDATE SET
+                membership_id = EXCLUDED.membership_id
+        """
+        _today = _get_today()
+        for universe in current_delisted_symbols:
+            current_list = current_delisted_symbols[universe]["current_symbols"]
+            self._upsert(query_upsert_membership, current_list)
+
+            current_list_membership = _add_today_to_tuple(self._select(query_select_membership), (_today,))
+            self._upsert(query_upsert_universe_membership, current_list_membership)
