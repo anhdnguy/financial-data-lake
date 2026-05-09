@@ -9,6 +9,9 @@ from src.db_client.db_client import DBClient
 # Import services
 from src.services.universe_service import UniverseService
 
+# Import transform
+from src.transform.universe_transform import _sanitize_symbol, _sort_delisted_from_active
+
 # Import bootstrap helper
 from src.utilities.bootstrap import get_service
 
@@ -40,9 +43,7 @@ def universe_maintenance():
 
     @task
     def sanitize(symbol_lists: Dict[str, List]):
-        pipeline_run_id = Variable.get("pipeline_run_id")
-        service = get_service("universe_maintenance", pipeline_run_id)
-        return service.sanitize_symbol(symbol_lists)
+        return _sanitize_symbol(symbol_lists)
 
     @task
     def query_active_symbols(symbol_lists: Dict[str, List]):
@@ -55,17 +56,10 @@ def universe_maintenance():
 
     @task
     def diff_symbols(dict_symbols: Dict[Dict[str, List]]):
-        pipeline_run_id = Variable.get("pipeline_run_id")
-        service = get_service("universe_maintenance", pipeline_run_id)
-        return service.diff_query_import(dict_symbols)
+        return _sort_delisted_from_active(dict_symbols)
 
     @task
     def upsert_membership():
-        "hello"
-        pass
-
-    @task
-    def upsert_universe_membership():
         pass
 
     @task
