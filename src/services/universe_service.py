@@ -77,6 +77,40 @@ class UniverseService:
 
         return active_symbols
 
+    def update_exit_date(self, current_delisted_symbols: Dict[str, Dict[str, List]]):
+        query_select_membership = """
+            SELECT id FROM membership WHERE symbol = ANY(%s)
+        """
+        query_update_exit_date = """
+            UPDATE universe_membership
+            SET exit_date = %s
+            WHERE membership_id = ANY(%s) AND universe_id = %s AND exit_date IS NULL
+        """
+        _today = _get_today()
+        try:
+            for universe in current_delisted_symbols:
+                delisted_list = current_delisted_symbols[universe]["delisted_symbols"]
+                if not delisted_list:
+                    continue
+                rows = self.client._select(query_select_membership, (delisted_list,))
+                membership_ids = [row[0] for row in rows]
+                if membership_ids:
+                    self.client._update(query_update_exit_date, (_today, membership_ids, universe))
+        except DBError as e:
+            logger.error("update_exit_date failed: %s", e)
+            raise PipelineDBError("Exit date update failed") from e
+        return current_delisted_symbols
+
+    def pipeline_end(self):
+        query = """
+            UPDATE pipeline_run SET status = %s, completed_at = NOW() WHERE id = %s
+        """
+        try:
+            self.client._update(query, ('SUCCESS', self.pipeline_run_id))
+        except DBError as e:
+            logger.error("pipeline_end failed: %s", e)
+            raise PipelineDBError("Pipeline end update failed") from e
+
     def upsert_membership_universe(self, current_delisted_symbols: Dict[str, Dict[str, List]]):
         query_upsert_membership = """
             INSERT INTO membership (symbol)
