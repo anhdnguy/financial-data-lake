@@ -1,10 +1,13 @@
+import logging
 import psycopg2
 from psycopg2.extras import execute_values
 from src.config import AppConfig
 
 from src.db_client.db_exception import (
-    DBError
+    DBError, DBConnectionError, DBQueryError
 )
+
+logger = logging.getLogger(__name__)
 
 class DBClient:
     def __init__(self, config: AppConfig):
@@ -25,7 +28,7 @@ class DBClient:
             return self
         
         except psycopg2.Error as e:
-            raise DBError(f"Connection failed: {str(e)}") from e
+            raise DBConnectionError(f"Connection failed: {str(e)}") from e
 
     def __exit__(self, exc_type, exc, tb):
         if self.cursor:
@@ -50,10 +53,9 @@ class DBClient:
 
         except psycopg2.Error as e:
             self.rollback()
-            print(f"Error message: {e.diag.message_primary}")
-            print(f"SQL state: {e.diag.sqlstate}")
-            print(f"Error position: {e.diag.statement_position}")
-            raise DBError(f"Insert failed: {str(e)}") from e
+            logger.error("Insert failed — message: %s | sqlstate: %s | position: %s",
+                         e.diag.message_primary, e.diag.sqlstate, e.diag.statement_position)
+            raise DBQueryError(f"Insert failed: {str(e)}") from e
         
     def _upsert(self, query: str, data: list) -> None:
         if not self.connection or self.connection.closed:
@@ -64,7 +66,7 @@ class DBClient:
 
         except psycopg2.Error as e:
             self.rollback()
-            raise DBError(f"Upsert failed: {str(e)}") from e
+            raise DBQueryError(f"Upsert failed: {str(e)}") from e
 
 
     def _update(self, query: str, data: tuple) -> None:
@@ -76,7 +78,7 @@ class DBClient:
         
         except psycopg2.Error as e:
             self.rollback()
-            raise DBError(f"Update failed: {str(e)}") from e
+            raise DBQueryError(f"Update failed: {str(e)}") from e
 
     def _select(self, query: str, data: tuple = None) -> list[tuple]:
         if not self.connection or self.connection.closed:
@@ -88,4 +90,4 @@ class DBClient:
             return rows
 
         except psycopg2.Error as e:
-            raise DBError(f"Select failed: {str(e)}") from e
+            raise DBQueryError(f"Select failed: {str(e)}") from e
