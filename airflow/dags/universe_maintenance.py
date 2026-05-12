@@ -77,16 +77,37 @@ def universe_maintenance():
             raise
 
     @task
-    def update_exit_date():
-        pass
+    def update_exit_date(current_and_delisted: Dict[str, Dict[str, List]]):
+        pipeline_run_id = Variable.get("pipeline_run_id")
+        service = get_service("universe_maintenance", pipeline_run_id)
+        try:
+            with service:
+                return service.update_exit_date(current_and_delisted)
+        except PipelineError as e:
+            log.error("update_exit_date failed: %s", e)
+            raise
 
     @task
-    def log_delisted():
-        pass
+    def log_delisted(current_and_delisted: Dict[str, Dict[str, List]]):
+        for universe, data in current_and_delisted.items():
+            delisted = data["delisted_symbols"]
+            if delisted:
+                log.info("Delisted from %s (%d symbols): %s", universe, len(delisted), delisted)
+            else:
+                log.info("No delistings for universe %s", universe)
 
     @task
     def log_pipeline_end():
-        pass
+        pipeline_run_id = Variable.get("pipeline_run_id")
+        service = get_service("universe_maintenance", pipeline_run_id)
+        try:
+            with service:
+                service.pipeline_end()
+        except PipelineError as e:
+            log.error("log_pipeline_end failed: %s", e)
+            raise
+        finally:
+            Variable.delete("pipeline_run_id")
 
     start = EmptyOperator(task_id='start')
     end = EmptyOperator(task_id='end')
@@ -103,9 +124,9 @@ def universe_maintenance():
 
     upsert_membership_task = upsert_membership(diff_symbols_task)
 
-    update_exit_date_task = update_exit_date()
+    update_exit_date_task = update_exit_date(diff_symbols_task)
 
-    log_delisted_task = log_delisted()
+    log_delisted_task = log_delisted(update_exit_date_task)
 
     log_pipeline_end_task = log_pipeline_end()
 
@@ -113,12 +134,6 @@ def universe_maintenance():
     start >> log_pipeline_start_task >> pull_symbol_from_csv_task
     pull_symbol_from_csv_task >> sanitize_task >> query_active_symbols_task
     query_active_symbols_task >> diff_symbols_task
-
-    # Extract new or delisted tickers
-    diff_symbols_task >> [upsert_membership_task, update_exit_date_task]
-
-    # Process delisted tickers
-    update_exit_date_task >> log_delisted_task
 
     # Final chain
     [upsert_membership_task, log_delisted_task] >> log_pipeline_end_task
