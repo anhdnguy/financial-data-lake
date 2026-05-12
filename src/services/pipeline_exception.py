@@ -1,0 +1,11 @@
+class PipelineError(Exception):
+    """Base exception for all pipeline service errors."""
+    pass
+
+class PipelineIOError(PipelineError):
+    """Raised when file I/O fails (missing CSV, bad format)."""
+    pass
+
+class PipelineDBError(PipelineError):
+    """Raised when a DB operation fails at the service boundary."""
+    pass

@@ -1,14 +1,19 @@
 import csv
+import logging
 from pathlib import Path
 from typing import List, Dict
 
 from src.db_client.db_client import DBClient
+from src.db_client.db_exception import DBError
+from src.services.pipeline_exception import PipelineIOError, PipelineDBError
 
 from src.transform.universe_transform import (
     _get_today, _convert_list_to_dict, _sanitize_symbol,
     _convert_tuple_to_list, _sort_delisted_from_active,
     _add_constants_to_tuple, _list_to_tuple
 )
+
+logger = logging.getLogger(__name__)
 
 class UniverseService:
     def __init__(self, client: DBClient, dag_id: str, pipeline_run_id: str):
@@ -43,10 +48,17 @@ class UniverseService:
 
     def pull_symbol(self):
         csv_dir = Path(__file__).parent.parent.parent / "stock_csv" / "tickers.csv"
-        with open(csv_dir, 'r') as file:
-            reader = csv.DictReader(file)
-            list_tickers = [row for row in reader]
-        
+        try:
+            with open(csv_dir, 'r') as file:
+                reader = csv.DictReader(file)
+                list_tickers = [row for row in reader]
+        except FileNotFoundError:
+            logger.error("Tickers CSV not found at %s", csv_dir)
+            raise PipelineIOError(f"Tickers CSV not found: {csv_dir}")
+        except csv.Error as e:
+            logger.error("Failed to parse tickers CSV: %s", e)
+            raise PipelineIOError(f"Tickers CSV parse error: {e}") from e
+
         dict_tickers = _convert_list_to_dict(list_tickers)
         return dict_tickers
     
@@ -78,11 +90,15 @@ class UniverseService:
             VALUES %s ON CONFLICT (membership_id, universe_id) WHERE exit_date IS NULL DO NOTHING
         """
         _today = _get_today()
-        for universe in current_delisted_symbols:
-            current_list = current_delisted_symbols[universe]["new_symbols"]
-            self.client._upsert(query_upsert_membership, _list_to_tuple(current_list))
+        try:
+            for universe in current_delisted_symbols:
+                current_list = current_delisted_symbols[universe]["new_symbols"]
+                self.client._upsert(query_upsert_membership, _list_to_tuple(current_list))
 
-            current_list_membership = _add_constants_to_tuple(
-                self.client._select(query_select_membership, (current_list,)), (universe, _today)
-            )
-            self.client._upsert(query_upsert_universe_membership, current_list_membership)
+                current_list_membership = _add_constants_to_tuple(
+                    self.client._select(query_select_membership, (current_list,)), (universe, _today)
+                )
+                self.client._upsert(query_upsert_universe_membership, current_list_membership)
+        except DBError as e:
+            logger.error("upsert_membership_universe failed for universe %s: %s", universe, e)
+            raise PipelineDBError(f"Membership upsert failed for universe {universe}") from e
