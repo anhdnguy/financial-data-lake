@@ -59,8 +59,12 @@ def universe_maintenance():
         return _sort_delisted_from_active(dict_symbols)
 
     @task
-    def upsert_membership():
-        pass
+    def upsert_membership(current_and_delisted: Dict[str, Dict[str, List]]):
+        pipeline_run_id = Variable.get("pipeline_run_id")
+        service = get_service("universe_maintenance", pipeline_run_id)
+
+        with service:
+            service.upsert_membership_universe(current_and_delisted)
 
     @task
     def update_exit_date():
@@ -87,9 +91,7 @@ def universe_maintenance():
 
     diff_symbols_task = diff_symbols(query_active_symbols_task)
 
-    upsert_membership_task = upsert_membership()
-
-    upsert_universe_membership_task = upsert_universe_membership()
+    upsert_membership_task = upsert_membership(diff_symbols_task)
 
     update_exit_date_task = update_exit_date()
 
@@ -105,14 +107,11 @@ def universe_maintenance():
     # Extract new or delisted tickers
     diff_symbols_task >> [upsert_membership_task, update_exit_date_task]
 
-    # Process new tickers
-    upsert_membership_task >> upsert_universe_membership_task
-
     # Process delisted tickers
     update_exit_date_task >> log_delisted_task
 
     # Final chain
-    [upsert_universe_membership_task, log_delisted_task] >> log_pipeline_end_task
+    [upsert_membership_task, log_delisted_task] >> log_pipeline_end_task
 
     log_pipeline_end_task >> end
 
