@@ -7,7 +7,7 @@ from src.db_client.db_client import DBClient
 from src.transform.universe_transform import (
     _get_today, _convert_list_to_dict, _sanitize_symbol,
     _convert_tuple_to_list, _sort_delisted_from_active,
-    _add_today_to_tuple
+    _add_constants_to_tuple, _list_to_tuple
 )
 
 class UniverseService:
@@ -68,21 +68,21 @@ class UniverseService:
     def upsert_membership_universe(self, current_delisted_symbols: Dict[str, Dict[str, List]]):
         query_upsert_membership = """
             INSERT INTO membership (symbol)
-            VALUES %s ON CONFLICT (symbol) DO UPDATE SET
-                symbol = EXCLUDED.symbol
+            VALUES %s ON CONFLICT (symbol) DO NOTHING
         """
         query_select_membership = """
-            SELECT id FROM membership WHERE updated_at = %s
+            SELECT id FROM membership WHERE symbol = ANY(%s)
         """
         query_upsert_universe_membership = """
-            INSERT INTO univese_membersip (membership_id, universe_id)
-            VALUES %s ON CONFLICT (membership_id) DO UPDATE SET
-                membership_id = EXCLUDED.membership_id
+            INSERT INTO universe_membership (membership_id, universe_id, enter_date)
+            VALUES %s ON CONFLICT (membership_id, universe_id) WHERE exit_date IS NULL DO NOTHING
         """
         _today = _get_today()
         for universe in current_delisted_symbols:
-            current_list = current_delisted_symbols[universe]["current_symbols"]
-            self._upsert(query_upsert_membership, current_list)
+            current_list = current_delisted_symbols[universe]["new_symbols"]
+            self.client._upsert(query_upsert_membership, _list_to_tuple(current_list))
 
-            current_list_membership = _add_today_to_tuple(self._select(query_select_membership), (_today,))
-            self._upsert(query_upsert_universe_membership, current_list_membership)
+            current_list_membership = _add_constants_to_tuple(
+                self.client._select(query_select_membership, (current_list,)), (universe, _today)
+            )
+            self.client._upsert(query_upsert_universe_membership, current_list_membership)
