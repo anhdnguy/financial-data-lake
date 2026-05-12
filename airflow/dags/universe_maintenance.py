@@ -1,21 +1,18 @@
+import logging
+import uuid
+
 from airflow.sdk import dag, task, Variable
 from airflow.providers.standard.operators.empty import EmptyOperator
 
 from typing import List, Dict
 
-# Import client
 from src.db_client.db_client import DBClient
-
-# Import services
 from src.services.universe_service import UniverseService
-
-# Import transform
+from src.services.pipeline_exception import PipelineError
 from src.transform.universe_transform import _sanitize_symbol, _sort_delisted_from_active
-
-# Import bootstrap helper
 from src.utilities.bootstrap import get_service
 
-import uuid
+log = logging.getLogger(__name__)
 
 default_args={
     'owner': 'Anh',
@@ -31,15 +28,22 @@ def universe_maintenance():
         pipeline_run_id = str(uuid.uuid4())
         Variable.set("pipeline_run_id", pipeline_run_id)
         service = get_service("universe_maintenance", pipeline_run_id)
-
-        with service:
-            service.pipeline_start()
+        try:
+            with service:
+                service.pipeline_start()
+        except PipelineError as e:
+            log.error("log_pipeline_start failed: %s", e)
+            raise
 
     @task
     def pull_symbol_from_csv() -> Dict[str, List]:
         pipeline_run_id = Variable.get("pipeline_run_id")
         service = get_service("universe_maintenance", pipeline_run_id)
-        return service.pull_symbol()
+        try:
+            return service.pull_symbol()
+        except PipelineError as e:
+            log.error("pull_symbol_from_csv failed: %s", e)
+            raise
 
     @task
     def sanitize(symbol_lists: Dict[str, List]):
@@ -49,10 +53,13 @@ def universe_maintenance():
     def query_active_symbols(symbol_lists: Dict[str, List]):
         pipeline_run_id = Variable.get("pipeline_run_id")
         service = get_service("universe_maintenance", pipeline_run_id)
-
-        with service:
-            symbols = service.query_symbols(symbol_lists)
-        return symbols
+        try:
+            with service:
+                symbols = service.query_symbols(symbol_lists)
+            return symbols
+        except PipelineError as e:
+            log.error("query_active_symbols failed: %s", e)
+            raise
 
     @task
     def diff_symbols(dict_symbols: Dict[Dict[str, List]]):
@@ -62,9 +69,12 @@ def universe_maintenance():
     def upsert_membership(current_and_delisted: Dict[str, Dict[str, List]]):
         pipeline_run_id = Variable.get("pipeline_run_id")
         service = get_service("universe_maintenance", pipeline_run_id)
-
-        with service:
-            service.upsert_membership_universe(current_and_delisted)
+        try:
+            with service:
+                service.upsert_membership_universe(current_and_delisted)
+        except PipelineError as e:
+            log.error("upsert_membership failed: %s", e)
+            raise
 
     @task
     def update_exit_date():
