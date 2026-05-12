@@ -48,13 +48,13 @@ def _sort_delisted_from_active(dict_symbols: Dict[Dict[str, List]]):
         query_set = set(_query[universe])
         import_set = set(_import[universe])
         result[universe] = {}
-        result[universe]["current_symbols"] = list(import_set | (import_set & query_set))
+        result[universe]["new_symbols"] = list(import_set - query_set)
         result[universe]["delisted_symbols"] = list(query_set - import_set)
     
     return result
 
-def _add_today_to_tuple(list_tuple: List[tuple]):
-    _today = _get_today()
-    for i, item in enumerate(list_tuple):
-        list_tuple[i] = item + (_today,)
-    return list_tuple
+def _list_to_tuple(list_of_str: List[str]):
+    return [(s,) for s in list_of_str]
+
+def _add_constants_to_tuple(list_tuple: List[tuple], tuple_constants: tuple):
+    return [item + tuple_constants for item in list_tuple]
