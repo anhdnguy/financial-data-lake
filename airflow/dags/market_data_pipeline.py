@@ -1,12 +1,9 @@
 from airflow.sdk import dag, task
 from airflow.providers.standard.operators.empty import EmptyOperator
 
-from typing import List, Dict, Any
+from typing import List, Dict
 import uuid
 
-from src.config import AppConfig
-from src.db_client.db_client import DBClient
-from src.services.market_data_service import MarketDataService
 from src.utilities.bootstrap import get_market_data_service
 from src.transform.ohlcv_transform import (
     chunk_symbols,
@@ -34,11 +31,9 @@ def on_failure_callback(context):
     )
 
     exception = context.get("exception")
-    config = AppConfig()
-    client = DBClient(config)
 
     with get_market_data_service(
-        client, "market_data_pipeline", pipeline_run_id
+        "market_data_pipeline", pipeline_run_id
     ) as service:
         service.pipeline_failed(
             pipeline_run_id=pipeline_run_id,
@@ -49,7 +44,7 @@ def on_failure_callback(context):
 
 @dag(
     "market_data_pipeline",
-    schedule="0 3 * * 1-5",  # 11 PM PST = 3 AM UTC, weekdays only
+    schedule="0 3 * * 1-5",  # 11 PM PST = 6 AM UTC, weekdays only
     default_args=default_args,
     catchup=False,
     tags=["financial_data_lake", "ETL", "ohlcv"],
@@ -65,11 +60,9 @@ def market_data_pipeline():
         status=RUNNING. Returns pipeline_run_id for downstream tasks.
         """
         pipeline_run_id = str(uuid.uuid4())
-        config = AppConfig()
-        client = DBClient(config)
 
         with get_market_data_service(
-            client, "market_data_pipeline", pipeline_run_id
+            "market_data_pipeline", pipeline_run_id
         ) as service:
             service.pipeline_start()
 
@@ -83,11 +76,9 @@ def market_data_pipeline():
         (retry_after <= now, attempts < max_attempts).
         Returns {"symbols": [...], "retries": [...]}
         """
-        config = AppConfig()
-        client = DBClient(config)
 
         with get_market_data_service(
-            client, "market_data_pipeline", pipeline_run_id
+            "market_data_pipeline", pipeline_run_id
         ) as service:
             return service.query_active_and_retry_symbols()
 
@@ -115,11 +106,9 @@ def market_data_pipeline():
         Logs failures to failed_ingestion.
         Returns list of valid raw OHLCV dicts.
         """
-        config = AppConfig()
-        client = DBClient(config)
 
         with get_market_data_service(
-            client, "market_data_pipeline", pipeline_run_id
+            "market_data_pipeline", pipeline_run_id
         ) as service:
             return service.fetch_and_validate_chunk(chunk)
 
@@ -153,11 +142,9 @@ def market_data_pipeline():
         Logs flagged rows to failed_ingestion (VALIDATION).
         Returns {"clean": [...], "flagged_count": int}
         """
-        config = AppConfig()
-        client = DBClient(config)
 
         with get_market_data_service(
-            client, "market_data_pipeline", pipeline_run_id
+            "market_data_pipeline", pipeline_run_id
         ) as service:
             return service.run_statistical_validation(raw_records)
 
@@ -173,11 +160,9 @@ def market_data_pipeline():
         Verifies write by reading Delta transaction log.
         Returns row count written.
         """
-        config = AppConfig()
-        client = DBClient(config)
 
         with get_market_data_service(
-            client, "market_data_pipeline", pipeline_run_id
+            "market_data_pipeline", pipeline_run_id
         ) as service:
             return service.write_delta(validated_payload["clean"])
 
@@ -193,11 +178,8 @@ def market_data_pipeline():
         if rows_written == 0:
             return
 
-        config = AppConfig()
-        client = DBClient(config)
-
         with get_market_data_service(
-            client, "market_data_pipeline", pipeline_run_id
+            "market_data_pipeline", pipeline_run_id
         ) as service:
             service.update_rolling_volatility()
 
@@ -212,16 +194,14 @@ def market_data_pipeline():
         records_failed.
         Clears pipeline_run_id XCom.
         """
-        config = AppConfig()
-        client = DBClient(config)
 
         with get_market_data_service(
-            client, "market_data_pipeline", pipeline_run_id
+            "market_data_pipeline", pipeline_run_id
         ) as service:
             service.pipeline_end(rows_written)
 
     # ------------------------------------------------------------------ #
-    # Task wiring                                                          #
+    # Task wiring                                                        #
     # ------------------------------------------------------------------ #
 
     start = EmptyOperator(task_id="start")
@@ -236,9 +216,7 @@ def market_data_pipeline():
     chunks = build_chunks(symbol_payload)
 
     # Dynamic task mapping — one fetch_ohlcv task per chunk
-    ohlcv_results = fetch_ohlcv.expand_kwargs(
-        [{"chunk": c, "pipeline_run_id": pipeline_run_id} for c in chunks]
-    )
+    ohlcv_results = fetch_ohlcv.partial(pipeline_run_id=pipeline_run_id).expand(chunk=chunks)
 
     # Aggregation and validation
     aggregated = aggregate_results(ohlcv_results, pipeline_run_id)
@@ -248,10 +226,11 @@ def market_data_pipeline():
     rows_written = write_to_delta_lake(validated, pipeline_run_id)
 
     # Post-write
-    update_volatility(rows_written, pipeline_run_id)
+    volatility_task = update_volatility(rows_written, pipeline_run_id)
 
     # Shutdown
-    log_pipeline_end(rows_written, pipeline_run_id) >> end
+    pipeline_end_task = log_pipeline_end(rows_written, pipeline_run_id)
+    volatility_task >> pipeline_end_task >> end
 
 
 market_data_pipeline()

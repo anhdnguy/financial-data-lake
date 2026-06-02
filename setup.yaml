@@ -10,3 +10,5 @@ dependencies:
     - deltalake
     - cryptography
     - psycopg2
+    - requests
+    - redis

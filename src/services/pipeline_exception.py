@@ -9,3 +9,7 @@ class PipelineIOError(PipelineError):
 class PipelineDBError(PipelineError):
     """Raised when a DB operation fails at the service boundary."""
     pass
+
+class PipelineAPIError(PipelineError):
+    """Raised when an external API call fails unrecoverably (e.g., token refresh)."""
+    pass

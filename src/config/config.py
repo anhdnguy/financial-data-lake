@@ -27,3 +27,13 @@ class AppConfig:
 
         if not self.db_name:
             raise ValueError("Required environment variable DB_DB is not set")
+
+        # Schwab API — optional; only required for market_data_pipeline
+        self.schwab_app_key: str = os.getenv("SCHWAB_APP_KEY")
+        self.schwab_app_secret: str = os.getenv("SCHWAB_APP_SECRET")
+        self.schwab_refresh_token: str = os.getenv("SCHWAB_REFRESH_TOKEN")
+        self.schwab_base_url: str = os.getenv("SCHWAB_BASE_URL", "https://api.schwabapi.com")
+
+        # Redis — optional; only required for market_data_pipeline token management
+        self.redis_host: str = os.getenv("REDIS_HOST", "localhost")
+        self.redis_port: int = int(os.getenv("REDIS_PORT", "6379"))
