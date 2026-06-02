@@ -4,8 +4,8 @@ import uuid
 from datetime import date
 from typing import List, Dict, Optional
 
-from src.db_client.db_client import DBClient
-from src.db_client.db_exception import DBError
+from src.clients.db_client import DBClient
+from src.clients.db_exception import DBError
 from src.clients.schwab_client import SchwabClient
 from src.clients.schwab_exception import SchwabTokenError, SchwabHTTPError, SchwabValidationError
 from src.services.pipeline_exception import PipelineDBError, PipelineAPIError

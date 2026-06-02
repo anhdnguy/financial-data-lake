@@ -3,8 +3,8 @@ import logging
 from pathlib import Path
 from typing import List, Dict
 
-from src.db_client.db_client import DBClient
-from src.db_client.db_exception import DBError
+from src.clients.db_client import DBClient
+from src.clients.db_exception import DBError
 from src.services.pipeline_exception import PipelineIOError, PipelineDBError
 
 from src.transform.universe_transform import (

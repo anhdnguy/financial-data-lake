@@ -3,7 +3,7 @@ from src.services.ohlcv_service import OHLCVService
 from src.clients.schwab_client import SchwabClient
 
 from src.config import AppConfig
-from src.db_client.db_client import DBClient
+from src.clients.db_client import DBClient
 
 def get_service(dag_id: str, pipeline_run_id: str) -> UniverseService:
     config = AppConfig()

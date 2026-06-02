@@ -6,7 +6,7 @@ from airflow.providers.standard.operators.empty import EmptyOperator
 
 from typing import List, Dict
 
-from src.db_client.db_client import DBClient
+from src.clients.db_client import DBClient
 from src.services.universe_service import UniverseService
 from src.services.pipeline_exception import PipelineError
 from src.transform.universe_transform import _sanitize_symbol, _sort_delisted_from_active
