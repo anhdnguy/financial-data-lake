@@ -38,7 +38,7 @@ def _convert_tuple_to_list(data: Any) -> List:
     
     return result
 
-def _sort_delisted_from_active(dict_symbols: Dict[Dict[str, List]]):
+def _sort_delisted_from_active(dict_symbols: Dict[str, Dict[str, List]]):
     result = {}
 
     _query = dict_symbols["query"]

@@ -62,7 +62,7 @@ def universe_maintenance():
             raise
 
     @task
-    def diff_symbols(dict_symbols: Dict[Dict[str, List]]):
+    def diff_symbols(dict_symbols: Dict[str, Dict[str, List]]):
         return _sort_delisted_from_active(dict_symbols)
 
     @task
