@@ -6,6 +6,7 @@ from typing import Dict
 
 import redis
 import requests
+from redis.exceptions import RedisError
 
 from src.config import AppConfig
 from src.clients.schwab_exception import (
@@ -30,27 +31,38 @@ class SchwabClient:
         )
 
     def _get_token(self) -> str:
-        token = self._redis.get(_TOKEN_KEY)
+        try:
+            token = self._redis.get(_TOKEN_KEY)
+        except RedisError as e:
+            raise SchwabTokenError(f"Redis unavailable on token read: {str(e)}") from e
         if token:
             return token.decode()
         return self._refresh_token()
 
     def _refresh_token(self) -> str:
-        for _ in range(_MAX_LOCK_RETRIES):
-            lock_acquired = self._redis.set(_LOCK_KEY, "1", nx=True, ex=_LOCK_TTL)
-            if lock_acquired:
-                try:
-                    token = self._do_refresh()
-                    self._redis.setex(_TOKEN_KEY, _TOKEN_TTL, token)
-                    return token
-                finally:
-                    self._redis.delete(_LOCK_KEY)
+        try:
+            for _ in range(_MAX_LOCK_RETRIES):
+                lock_acquired = self._redis.set(_LOCK_KEY, "1", nx=True, ex=_LOCK_TTL)
+                if lock_acquired:
+                    try:
+                        token = self._do_refresh()
+                        self._redis.setex(_TOKEN_KEY, _TOKEN_TTL, token)
+                        return token
+                    finally:
+                        # Best-effort release; the 30s TTL guarantees eventual cleanup,
+                        # so a release failure must not mask the real error.
+                        try:
+                            self._redis.delete(_LOCK_KEY)
+                        except RedisError:
+                            logger.warning("Failed to release token refresh lock")
 
-            # Another worker holds the lock — wait then check if token appeared
-            time.sleep(_LOCK_RETRY_SLEEP)
-            token = self._redis.get(_TOKEN_KEY)
-            if token:
-                return token.decode()
+                # Another worker holds the lock — wait then check if token appeared
+                time.sleep(_LOCK_RETRY_SLEEP)
+                token = self._redis.get(_TOKEN_KEY)
+                if token:
+                    return token.decode()
+        except RedisError as e:
+            raise SchwabTokenError(f"Redis unavailable on token refresh: {str(e)}") from e
 
         raise SchwabTokenError(
             "Failed to acquire token refresh lock after retries"
