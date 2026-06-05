@@ -8,17 +8,23 @@ from src.clients.db_client import DBClient
 from src.clients.db_exception import DBError
 from src.clients.schwab_client import SchwabClient
 from src.clients.schwab_exception import SchwabTokenError, SchwabHTTPError, SchwabValidationError
-from src.services.pipeline_exception import PipelineDBError, PipelineAPIError
+from src.clients.s3_client import S3DeltaClient
+from src.clients.s3_exception import S3Error, S3ReadError
+from src.services.pipeline_exception import (
+    PipelineDBError, PipelineAPIError, PipelineStorageError,
+)
+from src.transform.ohlcv_transform import build_dataframe, compute_rolling_volatility
 from src.transform.universe_transform import _get_today
 
 logger = logging.getLogger(__name__)
 
 
 class OHLCVService:
-    def __init__(self, client: DBClient, schwab: SchwabClient,
+    def __init__(self, client: DBClient, schwab: SchwabClient, s3: S3DeltaClient,
                  dag_id: str, pipeline_run_id: str):
         self.client = client
         self.schwab = schwab
+        self.s3 = s3
         self.pipeline_run_id = pipeline_run_id
         self.dag_id = dag_id
 
@@ -248,7 +254,44 @@ class OHLCVService:
         return results
 
     def write_delta(self, records: List[Dict]) -> int:
-        raise NotImplementedError("Requires deltalake + S3/LocalStack config.")
+        if not records:
+            return 0
+        try:
+            df = build_dataframe(records)
+            return self.s3.write(df)
+        except S3Error as e:
+            logger.error("write_delta failed: %s", e)
+            raise PipelineStorageError("Delta Lake write failed") from e
 
     def update_rolling_volatility(self) -> None:
-        raise NotImplementedError("Requires Delta Lake read for log-return computation.")
+        symbols = self.query_active_and_retry_symbols()["symbols"]
+        if not symbols:
+            return
+
+        try:
+            closes = self.s3.read_recent_closes(symbols, lookback=21)
+        except S3ReadError as e:
+            # No price history yet (e.g. first ever run) — nothing to compute, not a failure.
+            logger.warning("update_rolling_volatility: no Delta history yet: %s", e)
+            return
+
+        vol_map = compute_rolling_volatility(closes, window=20)
+        if not vol_map:
+            logger.info("update_rolling_volatility: no symbols had sufficient history")
+            return
+
+        rows = [(symbol, sd) for symbol, sd in vol_map.items()]
+        try:
+            self.client._upsert(
+                """
+                INSERT INTO volatility_rolling (symbol_id, rolling_sd)
+                SELECT m.id, v.sd::double precision
+                FROM (VALUES %s) AS v(symbol, sd)
+                JOIN membership m ON m.symbol = v.symbol
+                ON CONFLICT (symbol_id) DO UPDATE SET rolling_sd = EXCLUDED.rolling_sd
+                """,
+                rows,
+            )
+        except DBError as e:
+            logger.error("update_rolling_volatility upsert failed: %s", e)
+            raise PipelineDBError("Volatility upsert failed") from e

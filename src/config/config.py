@@ -37,3 +37,10 @@ class AppConfig:
         # Redis — optional; only required for market_data_pipeline token management
         self.redis_host: str = os.getenv("REDIS_HOST", "localhost")
         self.redis_port: int = int(os.getenv("REDIS_PORT", "6379"))
+
+        # S3 / Delta Lake — optional; only required for market_data_pipeline write layer
+        self.s3_endpoint_url: str = os.getenv("S3_ENDPOINT_URL", "http://localstack:4566")
+        self.aws_access_key_id: str = os.getenv("AWS_ACCESS_KEY_ID", "test")
+        self.aws_secret_access_key: str = os.getenv("AWS_SECRET_ACCESS_KEY", "test")
+        self.aws_region: str = os.getenv("AWS_REGION", "us-east-1")
+        self.delta_table_uri: str = os.getenv("DELTA_TABLE_URI", "s3://ohlcv/prices")

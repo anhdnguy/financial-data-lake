@@ -77,8 +77,13 @@ ON membership(symbol);
 CREATE INDEX idx_universe_membership_dates
 ON universe_membership(enter_date, exit_date);
 
-CREATE INDEX idx_pipeline_run_dag_date 
+CREATE INDEX idx_pipeline_run_dag_date
 ON pipeline_run(dag_id, run_date);
+
+-- One rolling volatility record per symbol; required for the volatility upsert's
+-- ON CONFLICT (symbol_id) target in update_rolling_volatility.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_volatility_rolling_symbol
+ON volatility_rolling(symbol_id);
 
 -- Updated_at trigger function
 CREATE OR REPLACE FUNCTION set_updated_at()
