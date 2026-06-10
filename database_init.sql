@@ -66,6 +66,23 @@ CREATE TABLE IF NOT EXISTS pipeline_run (
     notes TEXT
 );
 
+-- Schwab refresh token (durable source of truth).
+-- Holds the long-lived (7-day) refresh token; the short-lived (~30-min) access
+-- token lives only in Redis. issued_at anchors the 7-day hard wall, so the
+-- token provider can compute the TRUE remaining life when it seeds Redis or
+-- decides whether a proactive re-auth is due. One active token per provider
+-- (UNIQUE) → human re-auth is an idempotent ON CONFLICT (provider) upsert.
+-- issued_at is TIMESTAMPTZ on purpose: the wall math (issued_at + 7 days) is
+-- correctness-critical and a tz-naive value would shift the deadline by hours.
+CREATE TABLE IF NOT EXISTS schwab_token (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    provider VARCHAR(50) NOT NULL UNIQUE DEFAULT 'schwab',
+    refresh_token TEXT NOT NULL,
+    issued_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
 -- Indexes
 CREATE UNIQUE INDEX idx_universe_membership_active
 ON universe_membership(membership_id, universe_id)
@@ -107,4 +124,9 @@ FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 --- Apply trigger to volatility_rolling
 CREATE TRIGGER on_volatility_rolling_updated
 BEFORE UPDATE ON volatility_rolling
+FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
+
+-- Apply trigger to schwab_token (refreshes updated_at on each re-auth upsert)
+CREATE TRIGGER on_schwab_token_updated
+BEFORE UPDATE ON schwab_token
 FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
