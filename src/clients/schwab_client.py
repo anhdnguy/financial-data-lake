@@ -1,27 +1,16 @@
-import base64
 import logging
-import time
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Dict
 
-import redis
 import requests
-from redis.exceptions import RedisError
 
 from src.config import AppConfig
 from src.clients.schwab_token import SchwabTokenProvider
 from src.clients.schwab_exception import (
-    SchwabTokenError, SchwabHTTPError, SchwabValidationError
+    SchwabHTTPError, SchwabValidationError
 )
 
 logger = logging.getLogger(__name__)
-
-_TOKEN_KEY = "schwab:access_token"
-_LOCK_KEY = "schwab:token_refresh_lock"
-_TOKEN_TTL = 1500   # 25 minutes — 5-minute buffer before 30-minute expiry
-_LOCK_TTL = 30      # seconds — max time to hold the refresh lock
-_MAX_LOCK_RETRIES = 5
-_LOCK_RETRY_SLEEP = 0.5
 
 
 class SchwabClient:
