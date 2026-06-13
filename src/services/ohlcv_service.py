@@ -7,7 +7,9 @@ from typing import List, Dict, Optional
 from src.clients.db_client import DBClient
 from src.clients.db_exception import DBError
 from src.clients.schwab_client import SchwabClient
-from src.clients.schwab_exception import SchwabTokenError, SchwabHTTPError, SchwabValidationError
+from src.clients.schwab_exception import (
+    SchwabTokenError, SchwabAuthExpiredError, SchwabHTTPError, SchwabValidationError,
+)
 from src.clients.s3_client import S3DeltaClient
 from src.clients.s3_exception import S3Error, S3ReadError
 from src.services.pipeline_exception import (
@@ -242,6 +244,14 @@ class OHLCVService:
             try:
                 record = self.schwab.fetch_ohlcv(symbol)
                 results.append(record)
+            except SchwabAuthExpiredError as e:
+                # Terminal: the refresh token is dead. No retry fixes this —
+                # a human must re-authenticate. Abort loud; the message lands
+                # in pipeline_run.notes via the on_failure_callback.
+                logger.error("Schwab re-authentication required — aborting: %s", e)
+                raise PipelineAPIError(
+                    f"Schwab re-authentication required (review_required): {e}"
+                ) from e
             except SchwabTokenError as e:
                 logger.error("Token refresh failed — aborting chunk: %s", e)
                 raise PipelineAPIError("Schwab token refresh failed") from e
