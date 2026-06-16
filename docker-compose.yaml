@@ -1,3 +1,51 @@
+# ============================================================
+# Financial Data Lake — local infrastructure
+#   Data plane : ohlcv-db (Postgres), ohlcv-redis (token cache)
+#   Orchestration: dedicated single-project Airflow (LocalExecutor)
+#
+# Airflow reaches the data plane (ohlcv-db / ohlcv-redis / localstack)
+# over the external `shared-network` by service alias. Its own
+# components talk over the private `airflow-net` so they do NOT collide
+# with the multi-project ~/airflow stack that also lives on shared-network.
+# ============================================================
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  image: financial-data-lake/airflow:3.1.8
+  env_file:
+    - .env
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    # DAGs live in the project mount; src.* is importable via PYTHONPATH.
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/project/airflow/dags
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    # Resource-friendly for a low-power host (matches the ~/airflow tuning).
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: '60'
+    AIRFLOW__SCHEDULER__PARSING_PROCESSES: '1'
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: '120'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    PYTHONPATH: /opt/project
+  volumes:
+    # Whole project at /opt/project (NOT under /opt/airflow, so the init
+    # chown never touches your repo). Gives src/, stock_csv/, dags/.
+    - .:/opt/project
+    - ./airflow/logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    airflow-db:
+      condition: service_healthy
+  networks:
+    - airflow-net
+    - shared-network
+
 services:
   ohlcv-db:
     image: postgres:16
@@ -32,9 +80,114 @@ services:
     networks:
       - shared-network
 
+  # ── Airflow metadata DB (private to this project; not on shared-network) ──
+  airflow-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - airflow-net
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      # Host 8081 to avoid clashing with the ~/airflow stack on 8080.
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type DagProcessorJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type TriggererJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── One-shot: db migrate + admin user + fix log-dir ownership ──
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+
 volumes:
   ohlcv-db-volume:
+  airflow-db-volume:
 
 networks:
-    shared-network:
-      external: true
+  shared-network:
+    external: true
+  airflow-net:
+    driver: bridge
