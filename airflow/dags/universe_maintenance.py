@@ -74,7 +74,7 @@ def universe_maintenance():
 
     @task
     def upsert_membership(current_and_delisted: Dict[str, Dict[str, List]]):
-        pipeline_run_id = Variable.get("pipeline_run_id")
+        pipeline_run_id = Variable.get(_VAR_KEY)
         service = get_service("universe_maintenance", pipeline_run_id)
         try:
             with service:
