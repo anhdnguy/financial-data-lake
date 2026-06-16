@@ -19,14 +19,21 @@ default_args={
     'depends_on_past': False
 }
 
-@dag('universe_maintenance', schedule='@once', default_args=default_args,
-     catchup=False, tags=['financial_data_lake', 'ETL'], description='Extracting Data from Schwab')
+_VAR_KEY = "universe_tickers_retrieve_run_id"
+
+@dag(
+    'universe_maintenance',
+    schedule='0 0 * * 0', # 12 AM UTC, Sundays only
+    default_args=default_args,
+    catchup=False,
+    tags=['financial_data_lake', 'ETL'],
+    description='Weekly pulling tickers name from Russell 3000')
 def universe_maintenance():
 
     @task
     def log_pipeline_start() -> None:
         pipeline_run_id = str(uuid.uuid4())
-        Variable.set("pipeline_run_id", pipeline_run_id)
+        Variable.set(_VAR_KEY, pipeline_run_id)
         service = get_service("universe_maintenance", pipeline_run_id)
         try:
             with service:
@@ -37,7 +44,7 @@ def universe_maintenance():
 
     @task
     def pull_symbol_from_csv() -> Dict[str, List]:
-        pipeline_run_id = Variable.get("pipeline_run_id")
+        pipeline_run_id = Variable.get(_VAR_KEY)
         service = get_service("universe_maintenance", pipeline_run_id)
         try:
             return service.pull_symbol()
@@ -51,7 +58,7 @@ def universe_maintenance():
 
     @task
     def query_active_symbols(symbol_lists: Dict[str, List]):
-        pipeline_run_id = Variable.get("pipeline_run_id")
+        pipeline_run_id = Variable.get(_VAR_KEY)
         service = get_service("universe_maintenance", pipeline_run_id)
         try:
             with service:
@@ -78,7 +85,7 @@ def universe_maintenance():
 
     @task
     def update_exit_date(current_and_delisted: Dict[str, Dict[str, List]]):
-        pipeline_run_id = Variable.get("pipeline_run_id")
+        pipeline_run_id = Variable.get(_VAR_KEY)
         service = get_service("universe_maintenance", pipeline_run_id)
         try:
             with service:
@@ -98,7 +105,7 @@ def universe_maintenance():
 
     @task
     def log_pipeline_end():
-        pipeline_run_id = Variable.get("pipeline_run_id")
+        pipeline_run_id = Variable.get(_VAR_KEY)
         service = get_service("universe_maintenance", pipeline_run_id)
         try:
             with service:
@@ -107,7 +114,7 @@ def universe_maintenance():
             log.error("log_pipeline_end failed: %s", e)
             raise
         finally:
-            Variable.delete("pipeline_run_id")
+            Variable.delete(_VAR_KEY)
 
     start = EmptyOperator(task_id='start')
     end = EmptyOperator(task_id='end')
