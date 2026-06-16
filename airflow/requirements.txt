@@ -1,0 +1,6 @@
+# Runtime deps the DAGs/services pull in via `src.*`.
+# requests + cryptography already ship in the Airflow base image.
+deltalake
+pandas
+redis
+psycopg2-binary
