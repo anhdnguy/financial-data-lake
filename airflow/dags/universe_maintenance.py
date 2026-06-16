@@ -19,7 +19,7 @@ default_args={
     'depends_on_past': False
 }
 
-@dag('universe_maintenance', schedule='once', default_args=default_args,
+@dag('universe_maintenance', schedule='@once', default_args=default_args,
      catchup=False, tags=['financial_data_lake', 'ETL'], description='Extracting Data from Schwab')
 def universe_maintenance():
 
