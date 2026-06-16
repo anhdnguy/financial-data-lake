@@ -136,3 +136,36 @@ class UniverseService:
         except DBError as e:
             logger.error("upsert_membership_universe failed for universe %s: %s", universe, e)
             raise PipelineDBError(f"Membership upsert failed for universe {universe}") from e
+
+    def pipeline_failed(
+        self,
+        pipeline_run_id: Optional[str],
+        run_date: date,
+        error: str,
+    ) -> None:
+        try:
+            if pipeline_run_id is None:
+                rows = self.client._select(
+                    "SELECT id FROM pipeline_run WHERE dag_id = %s AND run_date = %s",
+                    (self.dag_id, run_date),
+                )
+                if not rows:
+                    logger.error(
+                        "pipeline_failed: no run found for dag_id=%s run_date=%s",
+                        self.dag_id,
+                        run_date,
+                    )
+                    return
+                pipeline_run_id = rows[0][0]
+
+            self.client._update(
+                """
+                UPDATE pipeline_run
+                SET status = 'FAILED', completed_at = NOW(), notes = %s
+                WHERE id = %s
+                """,
+                (error, pipeline_run_id),
+            )
+        except DBError as e:
+            logger.error("pipeline_failed update failed: %s", e)
+            raise PipelineDBError("Pipeline failed update failed") from e

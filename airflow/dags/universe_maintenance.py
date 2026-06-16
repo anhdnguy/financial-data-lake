@@ -21,6 +21,22 @@ default_args={
 
 _VAR_KEY = "universe_tickers_retrieve_run_id"
 
+def on_failure_callback(context):
+    try:
+        pipeline_run_id = Variable.get(_VAR_KEY)
+    except Exception:
+        pipeline_run_id = None
+
+    exception = context.get("exception")
+    run_id = pipeline_run_id or ""
+
+    with get_service("universe_maintenance", run_id) as service:
+        service.pipeline_failed(
+            pipeline_run_id=pipeline_run_id,
+            run_date=context["logical_date"].date(),
+            error=str(exception),
+        )
+
 @dag(
     'universe_maintenance',
     schedule='0 0 * * 0', # 12 AM UTC, Sundays only
