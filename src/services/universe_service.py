@@ -1,7 +1,8 @@
 import csv
 import logging
 from pathlib import Path
-from typing import List, Dict
+from datetime import date
+from typing import List, Dict, Optional
 
 from src.clients.db_client import DBClient
 from src.clients.db_exception import DBError
