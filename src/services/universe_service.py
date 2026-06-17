@@ -85,7 +85,7 @@ class UniverseService:
         query_update_exit_date = """
             UPDATE universe_membership
             SET exit_date = %s
-            WHERE membership_id = ANY(%s) AND universe_id = %s AND exit_date IS NULL
+            WHERE membership_id = ANY(%s::uuid[]) AND universe_id = %s AND exit_date IS NULL
         """
         _today = _get_today()
         try:
