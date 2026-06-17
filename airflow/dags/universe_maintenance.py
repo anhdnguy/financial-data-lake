@@ -43,7 +43,9 @@ def on_failure_callback(context):
     default_args=default_args,
     catchup=False,
     tags=['financial_data_lake', 'ETL'],
-    description='Weekly pulling tickers name from Russell 3000')
+    description='Weekly pulling tickers name from Russell 3000',
+    on_failure_callback=on_failure_callback
+)
 def universe_maintenance():
 
     @task
