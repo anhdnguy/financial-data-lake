@@ -24,18 +24,16 @@ class SchwabClient:
 
     def fetch_ohlcv(self, symbol: str) -> Dict:
         headers = self._headers()
-        today_utc = datetime.now(timezone.utc).date()
+        today_timestamp_utc = datetime.now(timezone.utc).timestamp()
 
         response = requests.get(
-            f"{self.config.schwab_base_url}/marketdata/v1/pricehistory",
+            f"{self.config.schwab_base_url}/pricehistory",
             headers=headers,
             params={
                 "symbol": symbol,
-                "periodType": "day",
-                "period": 1,
+                "periodType": "year",
                 "frequencyType": "daily",
-                "frequency": 1,
-                "needExtendedHoursData": "false",
+                "startDate": today_timestamp_utc
             },
             timeout=10,
         )
@@ -53,10 +51,14 @@ class SchwabClient:
         candle = data["candles"][-1]
 
         # Layer 1 — Date matches today UTC
-        candle_date = datetime.fromtimestamp(
-            candle["datetime"] / 1000, tz=timezone.utc
-        ).date()
-        if candle_date != today_utc:
+        candle_timestamp = candle["datetime"]
+        if candle_timestamp != today_timestamp_utc:
+            candle_date = datetime.fromtimestamp(
+                candle_timestamp / 1000, tz=timezone.utc
+            ).date()
+            today_utc = datetime.fromtimestamp(
+                today_timestamp_utc / 1000, tz=timezone.utc
+            ).date()
             raise SchwabValidationError(
                 f"{symbol}: candle date {candle_date} != today {today_utc}"
             )
