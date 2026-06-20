@@ -182,3 +182,67 @@ fire 20 simultaneous logins to Schwab. With it: one login, 19 quiet reuses.
   (the *single-flight* pattern), using a *distributed lock*.
 - **Borrow the connection, don't own it** — lower layers read through the
   service's DB client; only the service opens and closes it.
+
+## 2026-06-19 — Raw vs Adjusted data, OHLC, and the biases that ruin backtests
+
+Today started with a small code question — checking the High/Low validation in `schwab_client.py` — and unrolled into the most important data-integrity ideas in the whole project: what OHLC really *is*, why we measure returns the way we do, and the three biases that quietly make a backtest lie to you.
+
+### Lesson 1: OHLC isn't four prices — it's four summaries of the day's trades
+
+A stock doesn't *have* "a price." All day long it has a **stream of individual trades** (a "tape") — thousands or millions of buyer-meets-seller prints. OHLC is just four summary numbers computed over that one list:
+
+- **Open** = the *first* trade of the day
+- **Close** = the *last* trade of the day
+- **High** = the **maximum** price any trade printed
+- **Low** = the **minimum** price any trade printed
+
+This clears up the thing I had backwards. I thought "High only needs to beat Low." Wrong. High is the *max over everything that traded*, and Open, Close, and Low are all trades inside that same stream. So **High must be ≥ Open, Close, AND Low** — by definition. A candle where Open > High isn't a weird market day; it's a **corrupt record** (a feed bug or bad adjustment). That's exactly what the Layer 3 check in `schwab_client.py` enforces — so the code was already correct, and correct *because* it enforces the thing I doubted.
+
+### Lesson 2: Two kinds of validation — reject vs. quarantine
+
+There are two *different* kinds of bad data, and they get two different verdicts:
+
+- **Structurally impossible → reject outright.** Open > High, negative volume, Low > Close. These are *logically* impossible, so the data is provably wrong. Auto-drop. (This is Layer 3.)
+- **Suspicious but possible → quarantine for review, never auto-delete.** A 50% overnight gap *could* be a stock split (a non-event to adjust away) OR a real biotech that just failed a drug trial. The price alone can't tell which. So I don't get to delete it — it goes to the DLQ with `review_required` so a human decides.
+
+**The rule:** reject what's *impossible*; quarantine what's merely *implausible*.
+
+### Lesson 3: Why we measure returns close-to-close (not open-to-close)
+
+When we compute a daily return, we compare **today's close to yesterday's close**. Three reasons:
+
+1. **Cleanest price.** The close is the closing *auction* — the single moment with the most volume of the day. Most reliable, least noisy.
+2. **A continuous chain.** Yesterday's close is the *end* of yesterday's return and the *start* of today's. The measurements link end-to-end with no gaps and no overlaps — every bit of market time counted exactly once.
+3. **It captures overnight risk.** Open-to-close *throws away* the gap between 4pm and 9:30am — and that overnight window is where earnings and Fed news land. For a risk model, ignoring it would understate how dangerous the asset really is.
+
+**And the Open field's real job?** It's *not* part of the 5-sigma return filter (that's all close-to-close). Open is a **corporate-action tripwire**: a huge overnight gap (`Open / prev_Close`, e.g. \$200 → \$100) is the fingerprint of an unadjusted split. Different field, different job.
+
+### Lesson 4: The three biases — all the same disease
+
+| Bias | What it is | Direction it skews the backtest |
+|------|-----------|----------------------------------|
+| **Survivorship** | Building a universe from *today's* survivors, so the losers (delisted, bankrupt) are silently missing. A `DELETE`. | Looks **better** than reality |
+| **Look-ahead** | Using data you couldn't have known on that date (unreported earnings, restated numbers, retro-adjusted prices). An `UPDATE`. | Looks **better** than reality |
+| **Unadjusted split** | A 2-for-1 split (\$200→\$100, no economic change) read as a real −50% crash — a phantom return. | Hurts winners worst* |
+
+\*Splits cluster *after* a stock has run up, so the phantom crash lands onwinners — exactly what a momentum strategy holds. So momentum looks **worse** than reality, concentrated in its best names. Sneaky.
+
+**The common disease:** all three *contaminate the past with the future*. The defense is the same for all of them — and it's why our schema does soft-delete (`exit_date`, never `DELETE` a delisted name) and why Delta Lake writes are append-only.
+
+### Lesson 5: The keystone — "the price" is TWO things (this is what the title means)
+
+The paradox: I said "never overwrite a historical row," but a split *must* be fixed. How can a price be both immutable *and* adjustable? Resolution — it's two separate things stored in two places:
+
+1. **Raw price** = what *actually printed* that day. A historical **fact**, true forever. **Never overwrite it.** (This is what we store today.)
+2. **Corporate actions** (splits, dividends) = stored *separately*. The **adjusted** price is *computed* from raw + actions, and it's *allowed* to change — because a split five years from now must re-scale all of today's prices.
+
+So the backtest price = **raw fact + corporate-action adjustment**, joined at read time. Mature systems keep a **raw table** and a **corporate-actions table** as separate things. We have the raw table; the **corporate-actions table is the piece we don't have yet** — that's a Month 4 (point-in-time correctness) job.
+
+And the punchline that ties it to look-ahead: an *adjusted* price for 2020 literally changes every time a future split happens — so adjusted data "knows" the future. Keeping raw + actions separate is what lets us ask *"what did I know, and when did I know it?"* — which is the whole definition of **point-in-time correctness**.
+
+### One-line takeaways
+- **OHLC = four summaries of the day's trade stream.** High is a *max*, so it must dominate Open/Close/Low — that's why Layer 3 is correct.
+- **Reject the impossible, quarantine the implausible** (`review_required`, DLQ).
+- **Returns are close-to-close** — cleanest price, continuous chain, captures overnight risk. Open's job is a split tripwire, not the return filter.
+- **Survivorship / look-ahead / unadjusted-split** = one disease: leaking the future into the past. All make a backtest *look better than live trading*.
+- **"The price" is raw fact + corporate action.** Never overwrite the raw fact; recompute the adjustment. That's point-in-time correctness, and it's what makes a future backtest trustworthy.
