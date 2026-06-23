@@ -62,7 +62,7 @@ def market_data_pipeline():
 
     @task
     def build_chunks(symbol_payload: Dict[str, List]) -> List[List[str]]:
-        all_symbols = symbol_payload["symbols"] + symbol_payload["retries"]
+        all_symbols = list(set(symbol_payload["symbols"] + symbol_payload["retries"]))
         return chunk_symbols(all_symbols)
 
     @task
