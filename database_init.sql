@@ -102,6 +102,13 @@ ON pipeline_run(dag_id, run_date);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_volatility_rolling_symbol
 ON volatility_rolling(symbol_id);
 
+-- One open DLQ record per symbol; required for the ON CONFLICT (symbol_id) upsert in
+-- _log_ingestion_failure / run_statistical_validation. Makes failure logging idempotent
+-- (a re-trigger updates the existing row instead of inserting a duplicate) and lets the
+-- attempts counter actually accumulate across runs so the attempts < 3 retry cap works.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_failed_ingestion_symbol
+ON failed_ingestion(symbol_id);
+
 -- Updated_at trigger function
 CREATE OR REPLACE FUNCTION set_updated_at()
 RETURNS TRIGGER AS $$
