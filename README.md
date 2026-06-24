@@ -49,8 +49,11 @@ data-quality gates.
   queue, and an operational audit log.
 - **Survivorship-bias-aware universe maintenance** — delisted symbols are soft-deleted
   (an `exit_date` is set), never hard-deleted.
-- **Resilient external calls** — Redis `SET NX` distributed lock for Schwab token
-  refresh; failed symbols routed to a dead-letter queue for retry, not dropped.
+- **Two-tier Schwab token management** — short-lived access token cached in Redis,
+  durable refresh token in PostgreSQL; a single-flight `SET NX` lock collapses the
+  thundering herd of ~3000 concurrent cache misses into one refresh.
+- **Resilient external calls** — failed symbols routed to a dead-letter queue for retry,
+  not dropped; terminal vs. transient refresh failures are classified distinctly.
 - **Strict three-layer architecture** — orchestration, business logic, and I/O are
   cleanly separated, with pure functions for all transforms.
 
@@ -129,11 +132,14 @@ financial-data-lake/
 ├── src/
 │   ├── clients/                       # external-system boundaries (no business logic)
 │   │   ├── db_client.py               #   PostgreSQL (psycopg2, no internal commits)
-│   │   ├── schwab_client.py           #   Schwab API + Redis token lock + validation 1–3
-│   │   └── s3_client.py               #   Delta Lake on S3 (write / read_recent_closes)
+│   │   ├── schwab_client.py           #   Schwab API /pricehistory + validation 1–3
+│   │   ├── schwab_token.py            #   two-tier token: Redis cache + Postgres seed, SET NX
+│   │   ├── s3_client.py               #   Delta Lake on S3 (write / read_recent_closes)
+│   │   └── *_exception.py             #   db / schwab / s3 client error types
 │   ├── services/                      # business logic; own DB transaction lifecycle
 │   │   ├── universe_service.py
-│   │   └── ohlcv_service.py
+│   │   ├── ohlcv_service.py
+│   │   └── pipeline_exception.py
 │   ├── transform/                     # pure functions (no I/O)
 │   │   ├── universe_transform.py
 │   │   └── ohlcv_transform.py         #   chunk, build_dataframe, dedup, rolling vol
@@ -142,7 +148,7 @@ financial-data-lake/
 ├── scripts/
 │   └── create_bucket.sh               # one-time LocalStack bucket provisioning
 ├── stock_csv/tickers.csv              # universe seed (manual; iShares IWV planned)
-├── database_init.sql                  # schema: 6 tables + indexes + triggers
+├── database_init.sql                  # schema: 7 tables + indexes + triggers
 ├── docker-compose.yaml                # ohlcv-db + ohlcv-redis on shared-network
 ├── setup.yaml                         # conda environment definition
 └── .env.example                       # configuration template
@@ -162,6 +168,7 @@ PostgreSQL schema (`database_init.sql`), database `ohlcv`:
 | `volatility_rolling` | Per-ticker rolling volatility (one row per symbol) used by validation |
 | `failed_ingestion` | Dead-letter queue — `failure_mode` (`HTTP_ERROR` \| `VALIDATION`), `retry_after`, `review_required` |
 | `pipeline_run` | Operational audit log — status `RUNNING` \| `SUCCESS` \| `FAILED` \| `PARTIAL` |
+| `schwab_token` | Durable Schwab refresh token — one row per provider (`UNIQUE`), `issued_at` anchors the 7-day expiry wall |
 
 Highlights: a partial unique index enforces one active membership per symbol per universe
 (`exit_date IS NULL`); `updated_at` triggers on mutable tables; an index on
@@ -270,8 +277,7 @@ All configuration is loaded from `.env` by `AppConfig` (`src/config/config.py`).
 | `DB_USER` / `DB_PASSWORD` / `DB_DB` | PostgreSQL credentials + database | — |
 | `DB_HOSTNAME` | DB host (`ohlcv-db` in-network, `localhost` from host) | `localhost` |
 | `REDIS_HOST` / `REDIS_PORT` | Redis token cache + lock | `localhost` / `6379` |
-| `SCHWAB_APP_KEY` / `SCHWAB_APP_SECRET` | Schwab OAuth client credentials | — |
-| `SCHWAB_REFRESH_TOKEN` | Long-lived refresh token | — |
+| `SCHWAB_CLIENT_ID` / `SCHWAB_CLIENT_SECRET` | Schwab OAuth client credentials | — |
 | `SCHWAB_BASE_URL` | Schwab API base URL | `https://api.schwabapi.com` |
 | `S3_ENDPOINT_URL` | S3 endpoint (`localstack:4566` in-network) | `http://localstack:4566` |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | S3 credentials (`test`/`test` for LocalStack) | `test` |
@@ -281,6 +287,12 @@ All configuration is loaded from `.env` by `AppConfig` (`src/config/config.py`).
 > **Dual addressing:** services are reachable by container alias on `shared-network`
 > (e.g. `ohlcv-db`, `localstack:4566`) and by `localhost` from the host via published
 > ports. Set the host-style values when running anything outside the Docker network.
+
+> **The Schwab refresh token is _not_ an env var.** It is durable state, not config — it
+> lives in the PostgreSQL `schwab_token` table (one row per provider, anchored by
+> `issued_at` for the 7-day expiry wall) and is provisioned/rotated by the human re-auth
+> path. Only the OAuth client credentials (`SCHWAB_CLIENT_ID` / `SCHWAB_CLIENT_SECRET`)
+> come from `.env`. See [Design Decisions](#design-decisions).
 
 ---
 
@@ -328,6 +340,17 @@ small-files problem. Writes are append-only after in-pipeline deduplication;
 
 - **Delta Lake via `delta-rs`, not Spark** — the data volume doesn't justify Spark/JVM
   overhead; a pure-Python library is enough.
+- **Two-tier Schwab token model** — the access token (~30 min) and the refresh token
+  (~7 days) have different lifetimes and different homes, and conflating them was the bug
+  this design removed. The access token is cached in **Redis** under its own TTL; the
+  refresh token is durable in **PostgreSQL** (`schwab_token`, anchored by `issued_at` for
+  the hard 7-day wall). On a cache miss the refresh runs **single-flight** under a Redis
+  `SET NX` lock: the winner re-reads the cache, reads the refresh seed from Postgres
+  read-only, calls Schwab, and re-caches; losers poll for the fresh token or a short-TTL
+  `RedisErrorMarker` so a terminal failure fails them fast instead of spinning to a lock
+  timeout. The lock is released with a compare-and-delete (only the owner deletes), and
+  refresh failures are classified **terminal** (HTTP 400/401 / `invalid_grant` → human
+  re-auth) vs. **transient** (network / 5xx / 429 → retry next run).
 - **Dedicated `ohlcv-redis`, not Airflow's broker** — the token-refresh `SET NX` lock is
   a correctness primitive. A shared broker's `maxmemory`/LRU eviction could drop the lock
   key before its TTL and silently break mutual exclusion. A dedicated Redis with no cap
