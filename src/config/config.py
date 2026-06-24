@@ -31,7 +31,6 @@ class AppConfig:
         # Schwab API — optional; only required for market_data_pipeline
         self.schwab_client_id: str = os.getenv("SCHWAB_CLIENT_ID")
         self.schwab_client_secret: str = os.getenv("SCHWAB_CLIENT_SECRET")
-        self.schwab_refresh_token: str = os.getenv("SCHWAB_REFRESH_TOKEN")
         self.schwab_base_url: str = os.getenv("SCHWAB_BASE_URL", "https://api.schwabapi.com")
 
         # Redis — optional; only required for market_data_pipeline token management
