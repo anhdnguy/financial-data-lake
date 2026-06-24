@@ -143,6 +143,13 @@ class OHLCVService:
                         SELECT %s, m.id, %s, 'VALIDATION', %s,
                                NOW() + INTERVAL '1 hour', 1
                         FROM membership m WHERE m.symbol = %s
+                        ON CONFLICT (symbol_id) DO UPDATE SET
+                            failure = EXCLUDED.failure,
+                            failure_error = EXCLUDED.failure_error,
+                            retry_after = NOW() + INTERVAL '1 hour',
+                            attempts = failed_ingestion.attempts + 1,
+                            review_required = (failed_ingestion.attempts + 1) >= 3,
+                            created_at = NOW()
                         """,
                         (str(uuid.uuid4()), symbol, error_msg, symbol),
                     )
@@ -232,6 +239,13 @@ class OHLCVService:
                     (id, symbol_id, raw_symbol, failure, failure_error, retry_after, attempts)
                 SELECT %s, m.id, %s, %s, %s, NOW() + INTERVAL '1 hour', 1
                 FROM membership m WHERE m.symbol = %s
+                ON CONFLICT (symbol_id) DO UPDATE SET
+                    failure = EXCLUDED.failure,
+                    failure_error = EXCLUDED.failure_error,
+                    retry_after = NOW() + INTERVAL '1 hour',
+                    attempts = failed_ingestion.attempts + 1,
+                    review_required = (failed_ingestion.attempts + 1) >= 3,
+                    created_at = NOW()
                 """,
                 (str(uuid.uuid4()), symbol, failure_mode, error, symbol),
             )
