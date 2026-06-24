@@ -5,11 +5,7 @@ from typing import List, Dict
 import uuid
 
 from src.utilities.bootstrap import get_market_data_service
-from src.transform.ohlcv_transform import (
-    chunk_symbols,
-    build_dataframe,
-    deduplicate,
-)
+from src.transform.ohlcv_transform import chunk_symbols
 
 default_args = {
     "owner": "Anh",
@@ -72,11 +68,8 @@ def market_data_pipeline():
             return service.fetch_and_validate_chunk(chunk)
 
     @task
-    def aggregate_results(chunks_results: List[List[Dict]]) -> Dict:
-        flat = [row for chunk in chunks_results for row in chunk]
-        df = build_dataframe(flat)
-        df = deduplicate(df)
-        return df.to_dict(orient="records")
+    def aggregate_results(chunks_results: List[List[Dict]]) -> List[Dict]:
+        return [row for chunk in chunks_results for row in chunk]
 
     @task
     def statistical_validation(raw_records: Dict) -> Dict:
@@ -101,6 +94,8 @@ def market_data_pipeline():
     @task(trigger_rule="all_done")
     def log_pipeline_end(rows_written: int) -> None:
         pipeline_run_id = Variable.get(_VAR_KEY)
+        if rows_written is None:
+            rows_written = 0
         with get_market_data_service("market_data_pipeline", pipeline_run_id) as service:
             service.pipeline_end(rows_written)
         Variable.delete(_VAR_KEY)
