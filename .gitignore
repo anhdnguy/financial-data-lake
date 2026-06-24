@@ -19,3 +19,5 @@ dist/
 *.egg-info/
 
 CLAUDE.md
+
+stock_csv/tickers.csv
