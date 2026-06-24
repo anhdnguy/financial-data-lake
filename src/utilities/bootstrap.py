@@ -1,5 +1,6 @@
 from src.services.universe_service import UniverseService
 from src.services.ohlcv_service import OHLCVService
+from src.services.delta_maintenance_service import DeltaMaintenanceService
 from src.clients.schwab_client import SchwabClient
 from src.clients.schwab_token import (
     RedisTokenStore, RedisLock, RedisErrorMarker, SchwabTokenProvider,
@@ -24,6 +25,12 @@ def get_market_data_service(dag_id: str, pipeline_run_id: str) -> OHLCVService:
     schwab = build_schwab_client(config, client)
     s3 = S3DeltaClient(config)
     return OHLCVService(client, schwab, s3, dag_id, pipeline_run_id)
+
+def get_delta_maintenance_service(retention_hours: int = 168) -> DeltaMaintenanceService:
+    # No DBClient: maintenance is storage-only, outside any Postgres transaction.
+    config = AppConfig()
+    s3 = S3DeltaClient(config)
+    return DeltaMaintenanceService(s3, retention_hours=retention_hours)
 
 def build_schwab_client(config, db: DBClient) -> SchwabClient:
     r = redis.Redis(

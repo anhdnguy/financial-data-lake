@@ -1,6 +1,6 @@
 import logging
 from datetime import date
-from typing import List
+from typing import Dict, List, Optional
 
 import pandas as pd
 from deltalake import DeltaTable, write_deltalake
@@ -120,3 +120,60 @@ class S3DeltaClient:
 
         df = df[df["symbol"].isin(symbols)]
         return df[["symbol", "date", "close"]]
+
+    def optimize(self, target_size: Optional[int] = None) -> Dict:
+        """
+        Compact small Parquet files into fewer large ones (bin-packing) to fix the
+        small-file problem the daily appends create.
+
+        OPTIMIZE rewrites bytes, NOT rows: every (symbol, date, close, ...) value is
+        identical afterwards — the data is just repacked toward the target file size.
+        The original small files are NOT deleted here; they become *tombstones* (files
+        no longer referenced by the current table version) and stay on S3 until vacuum()
+        removes them. So OPTIMIZE temporarily INCREASES storage (old small files + new
+        big files coexist) until the next vacuum past the retention window.
+
+        target_size: bytes per output file. None lets delta-rs use the table default
+        (~256MB). Returns delta-rs compaction metrics (files added/removed, bytes, etc.).
+        """
+        try:
+            dt = DeltaTable(self._uri, storage_options=self._storage_options)
+            if target_size is not None:
+                return dt.optimize.compact(target_size=target_size)
+            return dt.optimize.compact()
+        except TableNotFoundError as e:
+            raise S3ReadError(f"Delta table not found at {self._uri}") from e
+        except Exception as e:
+            raise S3WriteError(f"Delta optimize failed: {str(e)}") from e
+
+    def vacuum(self, retention_hours: int = 168, dry_run: bool = True) -> List[str]:
+        """
+        Physically delete tombstoned data files older than retention_hours — the files
+        left behind by OPTIMIZE compactions and MERGE rewrites that the current version
+        no longer references.
+
+        VACUUM never deletes rows from the current table version. retention_hours is a
+        time-travel / in-flight-reader safety window, NOT a business data-retention knob:
+        the 20-day volatility lookback reads the *current* version, which vacuum cannot
+        touch regardless of how it is tuned. There is therefore no need to size retention
+        to the volatility window.
+
+        168h (7 days) is delta-rs's safety floor. Going below it requires
+        enforce_retention_duration=False and risks deleting files that a concurrent
+        reader or a recent time-travel query still needs — we only relax the guard when
+        the caller deliberately asks for a shorter window. dry_run=True (default) returns
+        the files that WOULD be removed without deleting anything.
+        """
+        # Only relax delta-rs's guard when the caller intentionally goes below the floor.
+        enforce = retention_hours >= 168
+        try:
+            dt = DeltaTable(self._uri, storage_options=self._storage_options)
+            return dt.vacuum(
+                retention_hours=retention_hours,
+                dry_run=dry_run,
+                enforce_retention_duration=enforce,
+            )
+        except TableNotFoundError as e:
+            raise S3ReadError(f"Delta table not found at {self._uri}") from e
+        except Exception as e:
+            raise S3WriteError(f"Delta vacuum failed: {str(e)}") from e
