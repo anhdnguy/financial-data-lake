@@ -36,8 +36,17 @@ class S3DeltaClient:
 
     def write(self, df: pd.DataFrame) -> int:
         """
-        Append a typed OHLCV frame to the Delta table, partitioned by year.
-        First write to a non-existent path creates the table. Returns rows written.
+        Upsert a typed OHLCV frame into the Delta table, keyed on (symbol, date),
+        partitioned by year. Idempotent: re-running the same day overwrites the matching
+        rows instead of appending duplicates, so a re-trigger / task retry after a partial
+        failure cannot silently double-write a day into the price store.
+
+        First write to a non-existent path bootstraps the table (MERGE needs an existing
+        target). Returns the number of rows upserted (the input frame length).
+
+        The source frame MUST be unique on (symbol, date) — delta-rs raises if multiple
+        source rows match one target row. The pipeline guarantees this via one row per
+        symbol per day (SchwabClient collapses the response to the latest candle).
         """
         if df.empty:
             return 0
@@ -46,12 +55,39 @@ class S3DeltaClient:
             # Partition layout is a storage concern, derived here rather than in the
             # pure transforms. Year partitioning keeps files large (no small-file problem).
             df["year"] = df["date"].dt.year.astype("int32")
-            write_deltalake(
-                self._uri,
-                df,
-                mode="append",
-                partition_by=["year"],
-                storage_options=self._storage_options,
+
+            try:
+                dt = DeltaTable(self._uri, storage_options=self._storage_options)
+            except TableNotFoundError:
+                # Bootstrap: no table yet, so MERGE has no target. The first write creates
+                # it; subsequent writes upsert. Append (not overwrite) so a concurrent/empty
+                # path is created cleanly with the year partitioning in place.
+                write_deltalake(
+                    self._uri,
+                    df,
+                    mode="append",
+                    partition_by=["year"],
+                    storage_options=self._storage_options,
+                )
+                return len(df)
+
+            # Key on (symbol, date). `target.year = source.year` is logically redundant
+            # (date determines year) but lets delta-rs prune to the touched year partitions
+            # instead of scanning the whole table for the join.
+            (
+                dt.merge(
+                    source=df,
+                    predicate=(
+                        "target.symbol = source.symbol "
+                        "AND target.date = source.date "
+                        "AND target.year = source.year"
+                    ),
+                    source_alias="source",
+                    target_alias="target",
+                )
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute()
             )
             return len(df)
         except Exception as e:
