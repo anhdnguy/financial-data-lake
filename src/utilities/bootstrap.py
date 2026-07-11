@@ -5,6 +5,7 @@ from src.clients.schwab_client import SchwabClient
 from src.clients.schwab_token import (
     RedisTokenStore, RedisLock, RedisErrorMarker, SchwabTokenProvider,
 )
+from src.clients.schwab_limiter import RedisTokenBucket
 from src.clients.s3_client import S3DeltaClient
 
 import redis
@@ -53,7 +54,17 @@ def build_schwab_client(config, db: DBClient) -> SchwabClient:
         base_url=config.schwab_base_url,
     )
 
+    # One limiter object per task process, but they all point at the same Redis
+    # key — N workers, ONE shared bucket (same pattern as the token store/lock).
+    limiter = RedisTokenBucket(
+        r,
+        key="schwab:rate_limiter",
+        capacity=config.schwab_limiter_capacity,
+        refill_period_ms=60_000.0 / config.schwab_calls_per_min,
+    )
+
     return SchwabClient(
         config=config,
-        token_provider=provider
+        token_provider=provider,
+        limiter=limiter,
     )
