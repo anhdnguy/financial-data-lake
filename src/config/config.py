@@ -37,6 +37,12 @@ class AppConfig:
         self.redis_host: str = os.getenv("REDIS_HOST", "localhost")
         self.redis_port: int = int(os.getenv("REDIS_PORT", "6379"))
 
+        # Schwab rate limiter — two independent dials. calls/min sets the AVERAGE
+        # (109 leaves headroom under the unverified 120/min ceiling); capacity
+        # sets the max BURST (1 = perfectly smooth, no spike possible).
+        self.schwab_calls_per_min: int = int(os.getenv("SCHWAB_CALLS_PER_MIN", "109"))
+        self.schwab_limiter_capacity: int = int(os.getenv("SCHWAB_LIMITER_CAPACITY", "1"))
+
         # S3 / Delta Lake — optional; only required for market_data_pipeline write layer
         self.s3_endpoint_url: str = os.getenv("S3_ENDPOINT_URL", "http://localstack:4566")
         self.aws_access_key_id: str = os.getenv("AWS_ACCESS_KEY_ID", "test")
