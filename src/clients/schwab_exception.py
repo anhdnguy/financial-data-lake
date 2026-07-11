@@ -11,6 +11,13 @@ class SchwabAuthExpiredError(SchwabError):
     TERMINAL: no retry can fix it; a human must re-authenticate in the browser.
     Surfaces as a review_required signal."""
 
+class SchwabRateLimitError(SchwabError):
+    """Raised when a rate-limiter token cannot be acquired — Redis is down or
+    the wait exceeded the acquire timeout. TRANSIENT infrastructure failure.
+    The limiter fails CLOSED (no token, no call): an unthrottled retry herd is
+    exactly what escalates Schwab's 429s into a 403 ban, so when the throttle
+    is broken we stop calling, never call unmetered."""
+
 class SchwabHTTPError(SchwabError):
     """Raised when the API returns a non-200 response."""
 
