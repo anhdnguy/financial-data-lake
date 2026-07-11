@@ -8,7 +8,8 @@ from src.clients.db_client import DBClient
 from src.clients.db_exception import DBError
 from src.clients.schwab_client import SchwabClient
 from src.clients.schwab_exception import (
-    SchwabTokenError, SchwabAuthExpiredError, SchwabHTTPError, SchwabValidationError,
+    SchwabTokenError, SchwabAuthExpiredError, SchwabRateLimitError,
+    SchwabHTTPError, SchwabValidationError,
 )
 from src.clients.s3_client import S3DeltaClient
 from src.clients.s3_exception import S3Error, S3ReadError
@@ -269,6 +270,12 @@ class OHLCVService:
             except SchwabTokenError as e:
                 logger.error("Token refresh failed — aborting chunk: %s", e)
                 raise PipelineAPIError("Schwab token refresh failed") from e
+            except SchwabRateLimitError as e:
+                # The limiter itself is broken (Redis down / acquire timeout),
+                # not this symbol. Fail CLOSED and abort the chunk — pressing on
+                # unthrottled is what escalates 429s into a 403 ban.
+                logger.error("Rate limiter unavailable — aborting chunk: %s", e)
+                raise PipelineAPIError("Schwab rate limiter unavailable") from e
             except SchwabHTTPError as e:
                 logger.warning("HTTP error for %s: %s", symbol, e)
                 self._log_ingestion_failure(symbol, "HTTP_ERROR", str(e))
