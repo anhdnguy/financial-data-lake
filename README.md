@@ -52,6 +52,11 @@ data-quality gates.
 - **Two-tier Schwab token management** — short-lived access token cached in Redis,
   durable refresh token in PostgreSQL; a single-flight `SET NX` lock collapses the
   thundering herd of ~3000 concurrent cache misses into one refresh.
+- **Distributed rate limiting** — an atomic Redis token bucket meters every Schwab call
+  across all concurrent workers (~109 calls/min, burst of 1), with exponential-backoff
+  429 handling that honors `Retry-After`. The limiter **fails closed**: no token, no call.
+- **Delta Lake maintenance DAG** — periodic `OPTIMIZE` (small-file compaction) +
+  `VACUUM` (tombstone cleanup) keeps the table healthy as daily appends accumulate.
 - **Resilient external calls** — failed symbols routed to a dead-letter queue for retry,
   not dropped; terminal vs. transient refresh failures are classified distinctly.
 - **Strict three-layer architecture** — orchestration, business logic, and I/O are
@@ -114,7 +119,7 @@ as separate Compose projects attached to the same `shared-network`.
 | Metadata DB | PostgreSQL 16 (`psycopg2`, `execute_values` for bulk ops) |
 | Price store | Delta Lake via `deltalake` (delta-rs) + PyArrow |
 | Object storage | LocalStack S3 in dev (AWS S3 in prod) |
-| Token cache / lock | Redis (`SET NX` distributed lock) |
+| Token cache / lock / rate limiter | Redis (`SET NX` lock, atomic Lua token bucket) |
 | Data source | Schwab API (`/pricehistory`) + CSV universe seed |
 | Data processing | pandas, NumPy |
 | Infra | Docker Compose |
@@ -128,17 +133,20 @@ financial-data-lake/
 ├── airflow/
 │   └── dags/
 │       ├── universe_maintenance.py    # weekly: maintain Russell 3000 membership
-│       └── market_data_pipeline.py    # daily: ingest + validate + store EOD OHLCV
+│       ├── market_data_pipeline.py    # daily: ingest + validate + store EOD OHLCV
+│       └── delta_maintenance.py       # periodic: Delta Lake OPTIMIZE + VACUUM
 ├── src/
 │   ├── clients/                       # external-system boundaries (no business logic)
 │   │   ├── db_client.py               #   PostgreSQL (psycopg2, no internal commits)
 │   │   ├── schwab_client.py           #   Schwab API /pricehistory + validation 1–3
 │   │   ├── schwab_token.py            #   two-tier token: Redis cache + Postgres seed, SET NX
-│   │   ├── s3_client.py               #   Delta Lake on S3 (write / read_recent_closes)
+│   │   ├── schwab_limiter.py          #   RedisTokenBucket — distributed rate limiter (Lua)
+│   │   ├── s3_client.py               #   Delta Lake on S3 (write / read / optimize / vacuum)
 │   │   └── *_exception.py             #   db / schwab / s3 client error types
 │   ├── services/                      # business logic; own DB transaction lifecycle
 │   │   ├── universe_service.py
 │   │   ├── ohlcv_service.py
+│   │   ├── delta_maintenance_service.py  # storage-only: OPTIMIZE + VACUUM (no DB)
 │   │   └── pipeline_exception.py
 │   ├── transform/                     # pure functions (no I/O)
 │   │   ├── universe_transform.py
@@ -147,7 +155,7 @@ financial-data-lake/
 │   └── utilities/bootstrap.py         # wires AppConfig + clients + service
 ├── scripts/
 │   └── create_bucket.sh               # one-time LocalStack bucket provisioning
-├── stock_csv/tickers.csv              # universe seed (manual; iShares IWV planned)
+├── stock_csv/tickers_sample.csv       # universe seed sample (real tickers.csv gitignored)
 ├── database_init.sql                  # schema: 7 tables + indexes + triggers
 ├── docker-compose.yaml                # ohlcv-db + ohlcv-redis on shared-network
 ├── setup.yaml                         # conda environment definition
@@ -189,7 +197,7 @@ Nine tasks, with `fetch_ohlcv` fanned out via dynamic task mapping for concurren
 
 ```
 log_pipeline_start → query_active_symbols → build_chunks
-        → fetch_ohlcv (mapped per chunk)        # Schwab fetch + validation layers 1–3
+        → fetch_ohlcv (mapped per chunk)        # rate-limited Schwab fetch + validation 1–3
         → aggregate_results                      # flatten, build DataFrame, dedup
         → statistical_validation                 # layer 4: 5-sigma outlier gate
         → write_to_delta_lake                    # year-partitioned append
@@ -200,6 +208,19 @@ log_pipeline_start → query_active_symbols → build_chunks
 A DAG-level `on_failure_callback` marks the run `FAILED`. Symbols that fail fetch or
 validation are written to the `failed_ingestion` dead-letter queue and retried on a later
 run rather than silently dropped.
+
+Every Schwab call (retries included) first acquires a token from a shared Redis token
+bucket, so all mapped tasks together stay on one metered drip (~109 calls/min → ~27 min
+for the full universe). A 429 triggers exponential backoff with jitter, honoring the
+`Retry-After` header when present; a symbol still throttled after 4 attempts goes to the
+DLQ instead of being hammered further.
+
+### `delta_maintenance` (every 25 days)
+Two tasks, strictly ordered: `OPTIMIZE` (bin-packing compaction of the small files the
+daily appends create) then `VACUUM` (physical deletion of tombstoned files older than the
+168-hour retention window). Retention is a time-travel / in-flight-reader safety window,
+not a business data-retention knob — `VACUUM` never touches the current table version,
+so the 20-day volatility lookback is unaffected.
 
 ---
 
@@ -279,6 +300,8 @@ All configuration is loaded from `.env` by `AppConfig` (`src/config/config.py`).
 | `REDIS_HOST` / `REDIS_PORT` | Redis token cache + lock | `localhost` / `6379` |
 | `SCHWAB_CLIENT_ID` / `SCHWAB_CLIENT_SECRET` | Schwab OAuth client credentials | — |
 | `SCHWAB_BASE_URL` | Schwab API base URL | `https://api.schwabapi.com` |
+| `SCHWAB_CALLS_PER_MIN` | Rate limiter: long-run **average** call rate | `109` |
+| `SCHWAB_LIMITER_CAPACITY` | Rate limiter: max **burst** (banked tokens) | `1` |
 | `S3_ENDPOINT_URL` | S3 endpoint (`localstack:4566` in-network) | `http://localstack:4566` |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | S3 credentials (`test`/`test` for LocalStack) | `test` |
 | `AWS_REGION` | AWS region | `us-east-1` |
@@ -331,8 +354,9 @@ s3://ohlcv/prices/
 ```
 
 Year partitioning (rather than daily) keeps file sizes healthy and avoids the
-small-files problem. Writes are append-only after in-pipeline deduplication;
-`OPTIMIZE` + `VACUUM` compaction is planned for a separate weekly maintenance DAG.
+small-files problem. Writes are append-only after in-pipeline deduplication; the
+`delta_maintenance` DAG periodically runs `OPTIMIZE` + `VACUUM` to compact the daily
+files and reap the resulting tombstones.
 
 ---
 
@@ -355,6 +379,21 @@ small-files problem. Writes are append-only after in-pipeline deduplication;
   a correctness primitive. A shared broker's `maxmemory`/LRU eviction could drop the lock
   key before its TTL and silently break mutual exclusion. A dedicated Redis with no cap
   guarantees the lock lives its full life.
+- **Distributed token-bucket rate limiter** (`RedisTokenBucket`) — Schwab's GET rate
+  limit is undocumented (observed: ~50 unthrottled pulls → 429s, sustained hammering →
+  temporary 403 ban), so every call is metered through one shared bucket in Redis. The
+  whole read → refill → check → spend sequence is a single atomic Lua script, and the
+  clock is Redis's own `TIME` — N workers carry N skewed clocks, and a fast local clock
+  stamping shared state would mint phantom tokens. The two dials are independent: the
+  refill period caps the long-run **average** (109/min leaves headroom under the
+  community-consensus ~120/min ceiling) while capacity caps the **burst** (1 = a
+  perfectly smooth drip; a spike is impossible by construction). Blocked workers sleep
+  the script-returned wait plus jitter so they don't wake in lockstep. The limiter
+  **fails closed** — Redis down or acquire timeout aborts the chunk rather than calling
+  unmetered, because an unthrottled retry herd is exactly what escalates 429s into a ban.
+- **Delta maintenance is storage-only** — `DeltaMaintenanceService` holds no `DBClient`
+  and no context manager: `OPTIMIZE`/`VACUUM` touch only the Delta-on-S3 boundary, so
+  there is no PostgreSQL transaction lifecycle to own.
 - **Clients never commit** — transaction control belongs to the service layer's
   `__exit__` (commit on success, rollback on exception).
 - **Soft deletes only** — delistings set `exit_date`; price points are never zeroed.
@@ -368,10 +407,11 @@ small-files problem. Writes are append-only after in-pipeline deduplication;
 - [x] Schwab API client with Redis token management
 - [x] `market_data_pipeline` DAG (dynamic task mapping, failure handling)
 - [x] Delta Lake write layer + rolling-volatility computation
+- [x] Distributed Schwab rate limiter (Redis token bucket + 429 backoff)
+- [x] `delta_maintenance` DAG — periodic `OPTIMIZE` + `VACUUM`
 - [ ] First end-to-end run with live Schwab credentials
 - [ ] `tests/` suite — transforms, clients (mocked), service
 - [ ] DLQ retry merge verified end-to-end
-- [ ] Weekly `OPTIMIZE` + `VACUUM` maintenance DAG
 - [ ] Point-in-time correctness / historical constituent snapshots (later phase)
 
 ---
