@@ -19,5 +19,8 @@ dist/
 *.egg-info/
 
 CLAUDE.md
+.claude/
+
+HANDBOOK.md
 
 stock_csv/tickers.csv
