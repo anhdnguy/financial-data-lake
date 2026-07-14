@@ -3,8 +3,8 @@
 > End-of-day OHLCV data pipeline for the Russell 3000 universe — built on Apache Airflow,
 > Delta Lake, and PostgreSQL.
 
-![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
-![Apache Airflow](https://img.shields.io/badge/Apache%20Airflow-TaskFlow-017CEE?logo=apacheairflow&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![Apache Airflow](https://img.shields.io/badge/Apache%20Airflow-3.1-017CEE?logo=apacheairflow&logoColor=white)
 ![Delta Lake](https://img.shields.io/badge/Delta%20Lake-delta--rs-00ADD8)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
 ![LocalStack](https://img.shields.io/badge/LocalStack-S3-7B42BC)
@@ -96,17 +96,22 @@ is written to PostgreSQL.
 `shared-network`:
 
 ```
-┌─────────────────────────  shared-network  ─────────────────────────┐
-│                                                                     │
-│   Airflow stack            ohlcv-db          ohlcv-redis            │
-│   (separate compose)       (PostgreSQL)      (token cache + lock)   │
-│                                                                     │
-│   LocalStack (S3)                                                   │
-└─────────────────────────────────────────────────────────────────────┘
+┌───────────────────────  shared-network (external)  ─────────────────────┐
+│                                                                          │
+│   ohlcv-db            ohlcv-redis               LocalStack (S3)          │
+│   (PostgreSQL)        (token cache + lock)      (separate compose)       │
+│                                                                          │
+│   Airflow — apiserver · scheduler · dag-processor · triggerer            │
+│      │      (LocalExecutor; also on this repo's private airflow-net)     │
+│      └── airflow-db (Airflow metadata — airflow-net only)                │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-This repo provisions `ohlcv-db` and `ohlcv-redis`. The Airflow and LocalStack stacks run
-as separate Compose projects attached to the same `shared-network`.
+This repo provisions everything except LocalStack: the data plane (`ohlcv-db`,
+`ohlcv-redis`) and a **dedicated single-project Airflow stack** (LocalExecutor, custom
+image with the project's runtime deps baked in). Airflow's own components talk over a
+private `airflow-net`, so its metadata DB never appears on `shared-network`. LocalStack
+runs as a separate Compose project attached to the same `shared-network`.
 
 ---
 
@@ -114,8 +119,8 @@ as separate Compose projects attached to the same `shared-network`.
 
 | Concern | Technology |
 |---------|-----------|
-| Orchestration | Apache Airflow (TaskFlow API, dynamic task mapping) |
-| Language | Python 3.11 |
+| Orchestration | Apache Airflow 3.1 (TaskFlow API, dynamic task mapping, LocalExecutor) |
+| Language | Python 3.12 |
 | Metadata DB | PostgreSQL 16 (`psycopg2`, `execute_values` for bulk ops) |
 | Price store | Delta Lake via `deltalake` (delta-rs) + PyArrow |
 | Object storage | LocalStack S3 in dev (AWS S3 in prod) |
@@ -131,10 +136,13 @@ as separate Compose projects attached to the same `shared-network`.
 ```
 financial-data-lake/
 ├── airflow/
-│   └── dags/
-│       ├── universe_maintenance.py    # weekly: maintain Russell 3000 membership
-│       ├── market_data_pipeline.py    # daily: ingest + validate + store EOD OHLCV
-│       └── delta_maintenance.py       # periodic: Delta Lake OPTIMIZE + VACUUM
+│   ├── dags/
+│   │   ├── universe_maintenance.py    # weekly: maintain Russell 3000 membership
+│   │   ├── market_data_pipeline.py    # daily: ingest + validate + store EOD OHLCV
+│   │   ├── delta_maintenance.py       # periodic: Delta Lake OPTIMIZE + VACUUM
+│   │   └── xcom_cleanup.py            # weekly: purge XComs >30 days from metadata DB
+│   ├── Dockerfile                     # Airflow image + project runtime deps baked in
+│   └── requirements.txt               # deps the DAGs pull in via src.*
 ├── src/
 │   ├── clients/                       # external-system boundaries (no business logic)
 │   │   ├── db_client.py               #   PostgreSQL (psycopg2, no internal commits)
@@ -157,7 +165,7 @@ financial-data-lake/
 │   └── create_bucket.sh               # one-time LocalStack bucket provisioning
 ├── stock_csv/tickers_sample.csv       # universe seed sample (real tickers.csv gitignored)
 ├── database_init.sql                  # schema: 7 tables + indexes + triggers
-├── docker-compose.yaml                # ohlcv-db + ohlcv-redis on shared-network
+├── docker-compose.yaml                # data plane (ohlcv-db, ohlcv-redis) + Airflow stack
 ├── setup.yaml                         # conda environment definition
 └── .env.example                       # configuration template
 ```
@@ -192,7 +200,7 @@ notation (`BRK/B → BRK.B`), diffs against active DB membership, upserts new sy
 **soft-deletes** delistings by setting `exit_date` — preserving history for survivorship-
 bias correctness.
 
-### `market_data_pipeline` (daily, weekdays)
+### `market_data_pipeline` (07:00 UTC, Tue–Sat — after each US trading day)
 Nine tasks, with `fetch_ohlcv` fanned out via dynamic task mapping for concurrent chunks:
 
 ```
@@ -222,6 +230,16 @@ daily appends create) then `VACUUM` (physical deletion of tombstoned files older
 not a business data-retention knob — `VACUUM` never touches the current table version,
 so the 20-day volatility lookback is unaffected.
 
+### `xcom_cleanup` (weekly, Sundays)
+XComs are ephemeral inter-task plumbing, and the daily pipeline pushes sizeable
+aggregate/validation payloads through them — left alone, the `xcom` table grows without
+bound. This DAG purges rows older than 30 days through the sanctioned
+`airflow db clean --tables xcom` CLI (Airflow 3's Task SDK forbids direct ORM access to
+the metadata DB from task code), with `--skip-archive` so the space is actually reclaimed
+rather than copied into archive tables. Scope is deliberately XCom-only: task and run
+history stays for the UI, and the durable audit trail is `pipeline_run` in the project
+DB, never XCom.
+
 ---
 
 ## OHLCV Validation
@@ -247,8 +265,8 @@ deliberately *not* annualized.
 
 - [Conda](https://docs.conda.io/) (Miniconda/Anaconda)
 - Docker + Docker Compose
-- The external `shared-network` Docker network, with the **Airflow** and **LocalStack**
-  stacks running on it:
+- The external `shared-network` Docker network, with the **LocalStack** stack running
+  on it (Airflow ships in this repo's own Compose stack):
   ```bash
   docker network create shared-network   # if it does not already exist
   ```
@@ -264,13 +282,16 @@ conda activate financial_data_lake
 
 ```bash
 cp .env.example .env
-# then edit .env — set DB_PASSWORD and your Schwab credentials
+# then edit .env — set DB_PASSWORD, your Schwab credentials, and generate
+# AIRFLOW__CORE__FERNET_KEY + AIRFLOW__API_AUTH__JWT_SECRET (one-liners are
+# in the .env.example comments)
 ```
 
 ### 3. Infrastructure
 
 ```bash
-docker-compose up -d                    # start ohlcv-db + ohlcv-redis
+docker-compose up -d    # data plane + Airflow (first boot: airflow-init migrates
+                        # the metadata DB and creates the web UI admin user)
 ```
 
 ### 4. Database schema
@@ -306,6 +327,10 @@ All configuration is loaded from `.env` by `AppConfig` (`src/config/config.py`).
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | S3 credentials (`test`/`test` for LocalStack) | `test` |
 | `AWS_REGION` | AWS region | `us-east-1` |
 | `DELTA_TABLE_URI` | Delta table path | `s3://ohlcv/prices` |
+| `AIRFLOW_UID` | Host UID for bind-mounted log ownership (Linux: `id -u`) | `50000` |
+| `AIRFLOW__CORE__FERNET_KEY` | Encrypts Airflow Connections/Variables at rest | — |
+| `AIRFLOW__API_AUTH__JWT_SECRET` | Signs tokens between Airflow components | — |
+| `_AIRFLOW_WWW_USER_USERNAME` / `_AIRFLOW_WWW_USER_PASSWORD` | Web UI admin login (created by `airflow-init`) | `airflow` |
 
 > **Dual addressing:** services are reachable by container alias on `shared-network`
 > (e.g. `ohlcv-db`, `localstack:4566`) and by `localhost` from the host via published
@@ -321,13 +346,15 @@ All configuration is loaded from `.env` by `AppConfig` (`src/config/config.py`).
 
 ## Running the Pipelines
 
-Airflow runs as a **separate Compose stack** on `shared-network`. Mount this repo's DAGs
-into it and ensure the repo root is on `PYTHONPATH` (the DAGs import `src.*`):
+Airflow ships in this repo's Compose stack: `docker-compose up -d` starts it with the
+project mounted at `/opt/project`, `PYTHONPATH` preset (the DAGs import `src.*`), and
+DAGs loading from `airflow/dags/`.
 
-- DAGs folder → `airflow/dags/`
-- `PYTHONPATH` → repo root
+Open the web UI at **http://localhost:8080** (login: `_AIRFLOW_WWW_USER_*` from `.env`).
+DAGs are **paused at creation** — unpause them, then trigger `universe_maintenance` once
+to seed membership, followed by `market_data_pipeline`.
 
-For lightweight local development you can instead run Airflow standalone on the host
+For lightweight local iteration you can instead run Airflow standalone on the host
 (using the `localhost` config overrides):
 
 ```bash
@@ -335,9 +362,6 @@ export AIRFLOW_HOME=$(pwd)/airflow
 export PYTHONPATH=$(pwd)
 airflow standalone
 ```
-
-Then trigger `universe_maintenance` once to seed membership, followed by
-`market_data_pipeline`.
 
 ---
 
@@ -409,19 +433,9 @@ files and reap the resulting tombstones.
 - [x] Delta Lake write layer + rolling-volatility computation
 - [x] Distributed Schwab rate limiter (Redis token bucket + 429 backoff)
 - [x] `delta_maintenance` DAG — periodic `OPTIMIZE` + `VACUUM`
-- [ ] First end-to-end run with live Schwab credentials
-- [ ] `tests/` suite — transforms, clients (mocked), service
-- [ ] DLQ retry merge verified end-to-end
+- [x] `xcom_cleanup` DAG — weekly XCom purge via `airflow db clean`
+- [x] First end-to-end run with live Schwab credentials
 - [ ] Point-in-time correctness / historical constituent snapshots (later phase)
-
----
-
-## Testing
-
-A `tests/` suite is planned (not yet implemented): unit tests for the pure transforms,
-client tests with mocked Redis / `requests` / Delta Lake, and service-level tests with a
-mocked `SchwabClient`. The intended approach is unit tests first (mock at each boundary),
-then integration, then end-to-end.
 
 ---
 
