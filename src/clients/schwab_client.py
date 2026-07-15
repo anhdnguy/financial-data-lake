@@ -1,7 +1,7 @@
 import logging
 import random
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict
 
 import requests
@@ -87,7 +87,7 @@ class SchwabClient:
         )
 
     def fetch_ohlcv(self, symbol: str) -> Dict:
-        today_utc = datetime.now(timezone.utc).date()
+        yesterday_utc = datetime.now(timezone.utc).date() - timedelta(days = 1)
 
         response = self._request_pricehistory(symbol)
 
@@ -107,9 +107,9 @@ class SchwabClient:
         candle_date = datetime.fromtimestamp(
             candle["datetime"] / 1000, tz=timezone.utc
         ).date()
-        if candle_date != today_utc:
+        if candle_date != yesterday_utc:
             raise SchwabValidationError(
-                f"{symbol}: candle date {candle_date} != today {today_utc}"
+                f"{symbol}: candle date {candle_date} != yesterday {yesterday_utc}"
             )
 
         # Layer 2 — All fields present and positive

@@ -34,7 +34,7 @@ def on_failure_callback(context):
 
 @dag(
     "market_data_pipeline",
-    schedule="0 7 * * 2-6",  # 7 AM UTC = 12 PM PST, weekdays only
+    schedule="30 6 * * 2-6",  # 5:30 AM UTC = 11:30 PM PST, weekdays only
     default_args=default_args,
     catchup=False,
     tags=["financial_data_lake", "ETL", "ohlcv"],
