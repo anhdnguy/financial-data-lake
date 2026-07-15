@@ -5,10 +5,11 @@
 
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![Apache Airflow](https://img.shields.io/badge/Apache%20Airflow-3.1-017CEE?logo=apacheairflow&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-7.4.9-red?logo=redis&logoColor=white)
 ![Delta Lake](https://img.shields.io/badge/Delta%20Lake-delta--rs-00ADD8)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
 ![LocalStack](https://img.shields.io/badge/LocalStack-S3-7B42BC)
-![Status](https://img.shields.io/badge/status-active%20development-yellow)
+![Status](https://img.shields.io/badge/status-complete-blue)
 
 A production-shaped data engineering project: it ingests daily price data for the top
 US equities, validates it through four layers, stores price history in **Delta Lake on
@@ -248,7 +249,7 @@ Every candle passes four layers before it is persisted:
 
 | Layer | Check | On failure |
 |-------|-------|-----------|
-| 1 — HTTP | Status 200, non-empty body, candle date == today (UTC) | Raise / DLQ |
+| 1 — HTTP | Status 200, non-empty body, candle date == yesterday (UTC) | Raise / DLQ |
 | 2 — Fields | `open/high/low/close/volume` present and positive | DLQ (`VALIDATION`) |
 | 3 — Consistency | `high ≥ open,close,low` and `low ≤ open,close` | DLQ (`VALIDATION`) |
 | 4 — Statistical | 5σ log-return filter, volume spike, open-vs-prev-close gap | DLQ (`VALIDATION`) |
