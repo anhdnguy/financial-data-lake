@@ -240,7 +240,7 @@ class OHLCVService:
                     (id, symbol_id, raw_symbol, failure, failure_error, retry_after, attempts)
                 SELECT %s, m.id, %s, %s, %s, NOW() + INTERVAL '1 hour', 1
                 FROM membership m WHERE m.symbol = %s
-                ON CONFLICT (id) DO UPDATE SET
+                ON CONFLICT (symbol_id) DO UPDATE SET
                     failure = EXCLUDED.failure,
                     failure_error = EXCLUDED.failure_error,
                     retry_after = NOW() + INTERVAL '1 hour',
