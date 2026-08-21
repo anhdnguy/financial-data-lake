@@ -12,3 +12,4 @@ dependencies:
     - psycopg2
     - requests
     - redis
+    - pandas_market_calendars

@@ -1,7 +1,7 @@
 import logging
 import random
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict
 
 import requests
@@ -12,6 +12,7 @@ from src.clients.schwab_limiter import RedisTokenBucket
 from src.clients.schwab_exception import (
     SchwabHTTPError, SchwabValidationError
 )
+from src.transform.ohlcv_transform import last_trading_date
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,7 @@ class SchwabClient:
         )
 
     def fetch_ohlcv(self, symbol: str) -> Dict:
-        yesterday_utc = datetime.now(timezone.utc).date() - timedelta(days = 1)
+        expected_date = last_trading_date(datetime.now(timezone.utc).date())
 
         response = self._request_pricehistory(symbol)
 
@@ -107,9 +108,9 @@ class SchwabClient:
         candle_date = datetime.fromtimestamp(
             candle["datetime"] / 1000, tz=timezone.utc
         ).date()
-        if candle_date != yesterday_utc:
+        if candle_date != expected_date:
             raise SchwabValidationError(
-                f"{symbol}: candle date {candle_date} != yesterday {yesterday_utc}"
+                f"{symbol}: candle date {candle_date} != expected {expected_date}"
             )
 
         # Layer 2 — All fields present and positive

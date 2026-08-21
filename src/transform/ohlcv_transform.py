@@ -1,14 +1,29 @@
 import logging
+from datetime import date, timedelta
 from typing import List, Dict
 
 import numpy as np
 import pandas as pd
+import pandas_market_calendars as mcal
 
 logger = logging.getLogger(__name__)
 
 
 def chunk_symbols(symbols: List[str], chunk_size: int = 100) -> List[List[str]]:
     return [symbols[i:i + chunk_size] for i in range(0, len(symbols), chunk_size)]
+
+
+def last_trading_date(as_of: date) -> date:
+    """
+    Most recent NYSE trading session strictly before `as_of`. "Yesterday" isn't
+    always a trading day (weekends, holidays), but Schwab's /pricehistory last
+    candle always is — this is what schwab_client's Layer-1 date check compares
+    the candle date against, instead of a naive as_of - 1 day.
+    """
+    nyse = mcal.get_calendar("NYSE")
+    sessions = nyse.valid_days(start_date=as_of - timedelta(days=10), end_date=as_of)
+    prior_sessions = [d.date() for d in sessions if d.date() < as_of]
+    return max(prior_sessions)
 
 
 def build_dataframe(records: List[Dict]) -> pd.DataFrame:
