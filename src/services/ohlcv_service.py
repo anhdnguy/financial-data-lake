@@ -16,7 +16,11 @@ from src.clients.s3_exception import S3Error, S3ReadError
 from src.services.pipeline_exception import (
     PipelineDBError, PipelineAPIError, PipelineStorageError,
 )
-from src.transform.ohlcv_transform import build_dataframe, compute_rolling_volatility
+from src.transform.ohlcv_transform import (
+    build_dataframe,
+    compute_rolling_volatility,
+    construct_dict_from_df
+)
 from src.transform.universe_transform import _get_today
 
 logger = logging.getLogger(__name__)
@@ -104,9 +108,16 @@ class OHLCVService:
 
         sorted_records = sorted(raw_records, key=lambda r: (r["symbol"], str(r["date"])))
 
+        try:
+            recent_closes = self.s3.read_recent_closes(symbols, lookback=1)
+            prev_close_map: Dict[str, float] = construct_dict_from_df(recent_closes, "symbol", "close")
+        except S3ReadError as e:
+            # No price history yet (e.g. first ever run) — nothing to compute, not a failure.
+            logger.warning("run_statistical_validation: no Delta history yet: %s", e)
+            prev_close_map = {}
+
         clean = []
         flagged_count = 0
-        prev_close_map: Dict[str, float] = {}
 
         for record in sorted_records:
             symbol = record["symbol"]
@@ -158,8 +169,6 @@ class OHLCVService:
                     logger.error("Failed to log validation failure for %s: %s", symbol, e)
             else:
                 clean.append(record)
-
-            prev_close_map[symbol] = close
 
         return {"clean": clean, "flagged_count": flagged_count}
 
@@ -299,14 +308,15 @@ class OHLCVService:
         if not symbols:
             return
 
+        rolling_window = 21
         try:
-            closes = self.s3.read_recent_closes(symbols, lookback=21)
+            closes = self.s3.read_recent_closes(symbols, lookback=rolling_window)
         except S3ReadError as e:
             # No price history yet (e.g. first ever run) — nothing to compute, not a failure.
             logger.warning("update_rolling_volatility: no Delta history yet: %s", e)
             return
 
-        vol_map = compute_rolling_volatility(closes, window=20)
+        vol_map = compute_rolling_volatility(closes, rolling_window - 1)
         if not vol_map:
             logger.info("update_rolling_volatility: no symbols had sufficient history")
             return

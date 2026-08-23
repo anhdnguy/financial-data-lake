@@ -44,6 +44,12 @@ def deduplicate(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def construct_dict_from_df(df: pd.DataFrame, key: str, value: str) -> Dict[str, float]:
+    df_to_dict = df.to_dict("records")
+    result = {item[key] : item[value] for item in df_to_dict}
+    return result
+
+
 def compute_rolling_volatility(closes: pd.DataFrame, window: int = 20) -> Dict[str, float]:
     """
     Per-symbol rolling volatility = sample std (ddof=1) of the last `window` DAILY log
