@@ -35,8 +35,8 @@ create table if not exists volatility_rolling (
 	symbol_id UUID NOT NULL REFERENCES membership(id),
 	created_at TIMESTAMP DEFAULT NOW(),
 	updated_at TIMESTAMP DEFAULT NOW(),
-	rolling_sd FLOAT not null
-);
+	rolling_sd FLOAT not null,
+	rolling_avg_volume FLOAT not null
 
 create type failure_mode as ENUM ('HTTP_ERROR', 'VALIDATION');
 
