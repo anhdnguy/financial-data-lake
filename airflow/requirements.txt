@@ -4,3 +4,4 @@ deltalake
 pandas
 redis
 psycopg2-binary
+pandas_market_calendars
