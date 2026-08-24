@@ -93,10 +93,14 @@ class S3DeltaClient:
         except Exception as e:
             raise S3WriteError(f"Delta write failed: {str(e)}") from e
 
-    def read_recent_closes(self, symbols: List[str], lookback: int = 21) -> pd.DataFrame:
+    def read_recent_closes(
+        self, symbols: List[str],
+        lookback: int = 21,
+        before: date | None = None
+    ) -> pd.DataFrame:
         """
         Read recent (symbol, date, close) rows for the given symbols. Prunes to the
-        current + previous year partitions, filter the subset of symbols, sort by symbol 
+        current + previous year partitions, filter the subset of symbols, sort by symbol
         and date, and trim based on the lookback days.
 
         Raises S3ReadError if the table does not exist yet (first ever run).
@@ -120,6 +124,8 @@ class S3DeltaClient:
 
         df = df[df["symbol"].isin(symbols)]
         df = df.sort_values(by=["symbol", "date"])
+        if before:
+            df = df[df["date"] < pd.Timestamp(before)]
         df = df.groupby("symbol").tail(lookback)
         return df[["symbol", "date", "close"]]
 

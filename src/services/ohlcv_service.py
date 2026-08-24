@@ -90,6 +90,7 @@ class OHLCVService:
             return {"clean": [], "flagged_count": 0}
 
         symbols = list({r["symbol"] for r in raw_records})
+        session_date = min(r["date"] for r in raw_records)
         try:
             vol_rows = self.client._select(
                 """
@@ -109,7 +110,7 @@ class OHLCVService:
         sorted_records = sorted(raw_records, key=lambda r: (r["symbol"], str(r["date"])))
 
         try:
-            recent_closes = self.s3.read_recent_closes(symbols, lookback=1)
+            recent_closes = self.s3.read_recent_closes(symbols, lookback=1, before=session_date)
             prev_close_map: Dict[str, float] = construct_dict_from_df(recent_closes, "symbol", "close")
         except S3ReadError as e:
             # No price history yet (e.g. first ever run) — nothing to compute, not a failure.
