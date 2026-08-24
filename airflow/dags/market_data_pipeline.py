@@ -98,7 +98,6 @@ def market_data_pipeline():
             rows_written = 0
         with get_market_data_service("market_data_pipeline", pipeline_run_id) as service:
             service.pipeline_end(rows_written)
-        Variable.delete(_VAR_KEY)
 
     # ------------------------------------------------------------------ #
     # Task wiring                                                          #
