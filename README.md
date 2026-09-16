@@ -58,8 +58,9 @@ data-quality gates.
   429 handling that honors `Retry-After`. The limiter **fails closed**: no token, no call.
 - **Delta Lake maintenance DAG** — periodic `OPTIMIZE` (small-file compaction) +
   `VACUUM` (tombstone cleanup) keeps the table healthy as daily appends accumulate.
-- **Resilient external calls** — failed symbols routed to a dead-letter queue for retry,
-  not dropped; terminal vs. transient refresh failures are classified distinctly.
+- **Resilient external calls** — failed symbols routed to a dead-letter queue, not
+  dropped, and cleared from it once they land in the price store; terminal vs. transient
+  refresh failures are classified distinctly.
 - **Strict three-layer architecture** — orchestration, business logic, and I/O are
   cleanly separated, with pure functions for all transforms.
 
@@ -159,11 +160,13 @@ financial-data-lake/
 │   │   └── pipeline_exception.py
 │   ├── transform/                     # pure functions (no I/O)
 │   │   ├── universe_transform.py
-│   │   └── ohlcv_transform.py         #   chunk, build_dataframe, dedup, rolling vol
+│   │   └── ohlcv_transform.py         #   chunk, build_dataframe, dedup, rolling stats,
+│   │                                  #   last_trading_date (NYSE calendar)
 │   ├── config/config.py               # AppConfig — env-var loading
 │   └── utilities/bootstrap.py         # wires AppConfig + clients + service
 ├── scripts/
-│   └── create_bucket.sh               # one-time LocalStack bucket provisioning
+│   ├── create_bucket.sh               # one-time LocalStack bucket provisioning
+│   └── setup_python.sh                # local interpreter/env helper
 ├── stock_csv/tickers_sample.csv       # universe seed sample (real tickers.csv gitignored)
 ├── database_init.sql                  # schema: 7 tables + indexes + triggers
 ├── docker-compose.yaml                # data plane (ohlcv-db, ohlcv-redis) + Airflow stack
@@ -182,8 +185,8 @@ PostgreSQL schema (`database_init.sql`), database `ohlcv`:
 | `universe` | Registry of universes (Russell 3000, S&P 500, …) |
 | `membership` | Symbol registry — **never deleted** |
 | `universe_membership` | Symbol ↔ universe with `enter_date` / `exit_date`, delisted reason |
-| `volatility_rolling` | Per-ticker rolling volatility (one row per symbol) used by validation |
-| `failed_ingestion` | Dead-letter queue — `failure_mode` (`HTTP_ERROR` \| `VALIDATION`), `retry_after`, `review_required` |
+| `volatility_rolling` | Per-ticker rolling stats — `rolling_sd` (daily log-return std) and `rolling_avg_volume`, one row per symbol, both used by Layer 4 |
+| `failed_ingestion` | Dead-letter queue — `failure_mode` (`HTTP_ERROR` \| `VALIDATION`), `attempts`, `review_required`. **Current-state, one row per symbol** (unique on `symbol_id`); the row is deleted once the symbol reaches the price store |
 | `pipeline_run` | Operational audit log — status `RUNNING` \| `SUCCESS` \| `FAILED` \| `PARTIAL` |
 | `schwab_token` | Durable Schwab refresh token — one row per provider (`UNIQUE`), `issued_at` anchors the 7-day expiry wall |
 
@@ -196,27 +199,36 @@ Highlights: a partial unique index enforces one active membership per symbol per
 ## Pipelines
 
 ### `universe_maintenance` (weekly)
-Keeps Russell 3000 membership current. Reads the universe CSV, normalizes symbols to dot
-notation (`BRK/B → BRK.B`), diffs against active DB membership, upserts new symbols, and
+Keeps Russell 3000 membership current. Reads the universe CSV, normalizes symbols to
+slash notation (`BRK.B → BRK/B` — `_sanitize_symbol` replaces every non-alphanumeric
+character with `/`), diffs against active DB membership, upserts new symbols, and
 **soft-deletes** delistings by setting `exit_date` — preserving history for survivorship-
 bias correctness.
 
-### `market_data_pipeline` (07:00 UTC, Tue–Sat — after each US trading day)
+### `market_data_pipeline` (06:30 UTC, Tue–Sat — after each US trading day)
 Nine tasks, with `fetch_ohlcv` fanned out via dynamic task mapping for concurrent chunks:
 
 ```
 log_pipeline_start → query_active_symbols → build_chunks
         → fetch_ohlcv (mapped per chunk)        # rate-limited Schwab fetch + validation 1–3
-        → aggregate_results                      # flatten, build DataFrame, dedup
-        → statistical_validation                 # layer 4: 5-sigma outlier gate
-        → write_to_delta_lake                    # year-partitioned append
-        → update_volatility                      # recompute rolling vol → PostgreSQL
+        → aggregate_results                      # flatten the mapped chunk results
+        → statistical_validation                 # layer 4: outlier + volume gate
+        → write_to_delta_lake                    # build frame, dedup, year-partitioned merge
+        → update_volatility                      # recompute rolling stats → PostgreSQL
         → log_pipeline_end                       # SUCCESS / PARTIAL / FAILED
 ```
 
 A DAG-level `on_failure_callback` marks the run `FAILED`. Symbols that fail fetch or
-validation are written to the `failed_ingestion` dead-letter queue and retried on a later
-run rather than silently dropped.
+validation are written to the `failed_ingestion` dead-letter queue rather than silently
+dropped, and their rows are deleted once the symbol next reaches the price store.
+
+There is deliberately **no separate retry list**: the pipeline fetches the whole active
+universe every run, so a symbol that fails today is refetched tomorrow as a matter of
+course — today's run *is* the retry. `failed_ingestion` is therefore a monitoring
+surface ("what is broken right now, and for how many runs"), not an input to the fetch
+list. `log_pipeline_end` derives run status from symbols *attempted* versus rows
+*written*, never from the DLQ count — a DLQ that cannot accept writes would otherwise
+report a clean run.
 
 Every Schwab call (retries included) first acquires a token from a shared Redis token
 bucket, so all mapped tasks together stay on one metered drip (~109 calls/min → ~27 min
@@ -249,14 +261,23 @@ Every candle passes four layers before it is persisted:
 
 | Layer | Check | On failure |
 |-------|-------|-----------|
-| 1 — HTTP | Status 200, non-empty body, candle date == yesterday (UTC) | Raise / DLQ |
+| 1 — HTTP | Status 200, non-empty body, candle date == last NYSE session | Raise / DLQ |
 | 2 — Fields | `open/high/low/close/volume` present and positive | DLQ (`VALIDATION`) |
 | 3 — Consistency | `high ≥ open,close,low` and `low ≤ open,close` | DLQ (`VALIDATION`) |
-| 4 — Statistical | 5σ log-return filter, volume spike, open-vs-prev-close gap | DLQ (`VALIDATION`) |
+| 4 — Statistical | 5σ log return, 3σ open-vs-prev-close gap, 10× volume spike | DLQ (`VALIDATION`) |
 
 Layer 4 uses each ticker's **daily** log-return standard deviation (`rolling_sd`, sample
 `ddof=1`) as the threshold on a single-day log return — so the stored volatility is
-deliberately *not* annualized.
+deliberately *not* annualized. Both the return and the gap are measured as **log ratios**,
+matching `rolling_sd`'s units: comparing a dollar difference against a dimensionless
+standard deviation is a units error that silently rejects most of the universe.
+
+The volume multiple (10×) is deliberately loose — this is a bad-tick filter, and earnings
+or index rebalances routinely run 3–5× without the price data being wrong.
+
+A symbol with no rolling baseline yet (a recent listing, or the first run for that ticker)
+has **no** statistical check applied. Those records pass, but are counted separately as
+`unvalidated_count` so a run cannot report a clean bill of health it never earned.
 
 ---
 
@@ -379,9 +400,12 @@ s3://ohlcv/prices/
 ```
 
 Year partitioning (rather than daily) keeps file sizes healthy and avoids the
-small-files problem. Writes are append-only after in-pipeline deduplication; the
-`delta_maintenance` DAG periodically runs `OPTIMIZE` + `VACUUM` to compact the daily
-files and reap the resulting tombstones.
+small-files problem. Writes are an **idempotent `MERGE` on (symbol, date)**, so a task
+retry or a re-triggered run overwrites the matching rows instead of double-writing a day
+(only the very first write, which has no table to merge into, is a plain append). The
+source frame is de-duplicated before the merge, since delta-rs raises if two source rows
+match one target row. The `delta_maintenance` DAG periodically runs `OPTIMIZE` + `VACUUM`
+to compact the daily files and reap the resulting tombstones.
 
 ---
 
@@ -419,8 +443,12 @@ files and reap the resulting tombstones.
 - **Delta maintenance is storage-only** — `DeltaMaintenanceService` holds no `DBClient`
   and no context manager: `OPTIMIZE`/`VACUUM` touch only the Delta-on-S3 boundary, so
   there is no PostgreSQL transaction lifecycle to own.
-- **Clients never commit** — transaction control belongs to the service layer's
-  `__exit__` (commit on success, rollback on exception).
+- **Clients never commit _or roll back_** — transaction control belongs to the service
+  layer's `__exit__` (commit on success, rollback on exception). A client-side rollback
+  discards work the service has already staged, so `DBClient` exposes a `savepoint()`
+  context manager instead: Postgres aborts the whole transaction on any statement error,
+  and a savepoint is what lets one failed per-symbol write be caught without poisoning
+  the rest of the batch.
 - **Soft deletes only** — delistings set `exit_date`; price points are never zeroed.
 - **Parameterized SQL only** — no f-string interpolation, ever.
 
@@ -436,7 +464,35 @@ files and reap the resulting tombstones.
 - [x] `delta_maintenance` DAG — periodic `OPTIMIZE` + `VACUUM`
 - [x] `xcom_cleanup` DAG — weekly XCom purge via `airflow db clean`
 - [x] First end-to-end run with live Schwab credentials
+- [ ] Automated test suite (framework not yet chosen — see [Testing](#testing))
 - [ ] Point-in-time correctness / historical constituent snapshots (later phase)
+
+---
+
+## Testing
+
+There is **no automated test suite yet** — `setup.yaml` pins no test framework and the
+tooling choice is deliberately still open. This is the project's largest known gap.
+
+Verification today is manual and evidence-based: changes are exercised against the live
+LocalStack / PostgreSQL stack using read-only probes, or inside a transaction that is
+rolled back afterwards, and pipeline health is read back from `pipeline_run` and the DAG
+logs.
+
+Two bugs found in September 2026 are the argument for the suite — each would have been
+caught in seconds by a single unit test:
+
+- **`open_gap` units** — the open-vs-previous-close gap was compared as a dollar
+  difference against a dimensionless log-return standard deviation, flagging 2455 of
+  2902 symbols on an ordinary trading day.
+- **`pipeline_end` status** — `SUCCESS` was derived from a dead-letter-queue count that
+  read zero precisely when the DLQ writes themselves were failing, so five consecutive
+  runs reported success while the daily write shrank from 3010 rows to 614.
+
+First tests to write, in priority order: `run_statistical_validation` (threshold units,
+and the no-baseline path), `pipeline_end` (the full status matrix),
+`compute_rolling_volatility` (insufficient-history skip), then the transform functions —
+pure, no mocks required.
 
 ---
 
