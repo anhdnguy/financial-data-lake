@@ -19,11 +19,17 @@ from src.services.pipeline_exception import (
 from src.transform.ohlcv_transform import (
     build_dataframe,
     compute_rolling_volatility,
-    construct_dict_from_df
+    construct_dict_from_df,
+    deduplicate,
 )
 from src.transform.universe_transform import _get_today
 
 logger = logging.getLogger(__name__)
+
+# Layer-4 volume spike: today's volume against the 20-day average. Loose on purpose —
+# this is a bad-tick filter, not a signal. Earnings and index rebalances routinely move
+# 3-5x; 10x is the range where a data error is more likely than a real session.
+_VOLUME_SPIKE_MULTIPLE = 10.0
 
 
 class OHLCVService:
@@ -58,43 +64,47 @@ class OHLCVService:
             logger.error("pipeline_start failed: %s", e)
             raise PipelineDBError("Pipeline start insert failed") from e
 
-    def query_active_and_retry_symbols(self) -> Dict[str, List]:
+    def query_active_symbols(self) -> List[str]:
+        """
+        Every active universe member — the full daily fetch list.
+
+        There is deliberately no separate DLQ "retry" list. This pipeline fetches the
+        WHOLE active universe every run, so a symbol that failed today is refetched
+        tomorrow as a matter of course: today's run IS the retry. A retry query could
+        only ever contribute symbols the active list does not already contain — which
+        means symbols no longer in the universe, exactly the delisted tickers that were
+        being resurrected and refetched forever.
+
+        failed_ingestion therefore feeds nothing back into the fetch list. It is a
+        monitoring surface: which symbols are broken right now (rows are deleted once a
+        symbol reaches the price store) and how many runs they have been failing.
+        A retry list would only earn its keep if the daily fetch were ever narrowed to
+        a subset of the universe.
+        """
         query_active = """
             SELECT DISTINCT m.symbol
             FROM universe_membership um
             JOIN membership m ON um.membership_id = m.id
             WHERE um.exit_date IS NULL
         """
-        query_retries = """
-            SELECT DISTINCT m.symbol
-            FROM failed_ingestion fi
-            JOIN membership m ON fi.symbol_id = m.id
-            WHERE fi.retry_after <= NOW()
-              AND fi.review_required = FALSE
-              AND fi.attempts < 3
-        """
         try:
             active_rows = self.client._select(query_active)
-            retry_rows = self.client._select(query_retries)
         except DBError as e:
-            logger.error("query_active_and_retry_symbols failed: %s", e)
+            logger.error("query_active_symbols failed: %s", e)
             raise PipelineDBError("Symbol query failed") from e
 
-        return {
-            "symbols": [row[0] for row in active_rows],
-            "retries": [row[0] for row in retry_rows],
-        }
+        return [row[0] for row in active_rows]
 
     def run_statistical_validation(self, raw_records: List[Dict]) -> Dict:
         if not raw_records:
-            return {"clean": [], "flagged_count": 0}
+            return {"clean": [], "flagged_count": 0, "unvalidated_count": 0}
 
         symbols = list({r["symbol"] for r in raw_records})
         session_date = min(r["date"] for r in raw_records)
         try:
             vol_rows = self.client._select(
                 """
-                SELECT m.symbol, vr.rolling_sd
+                SELECT m.symbol, vr.rolling_sd, vr.rolling_avg_volume
                 FROM volatility_rolling vr
                 JOIN membership m ON vr.symbol_id = m.id
                 WHERE m.symbol = ANY(%s)
@@ -106,6 +116,7 @@ class OHLCVService:
             raise PipelineDBError("Volatility rolling query failed") from e
 
         rolling_sd_map = {row[0]: row[1] for row in vol_rows}
+        rolling_volume_map = {row[0]: row[2] for row in vol_rows}
 
         sorted_records = sorted(raw_records, key=lambda r: (r["symbol"], str(r["date"])))
 
@@ -119,17 +130,21 @@ class OHLCVService:
 
         clean = []
         flagged_count = 0
+        unvalidated_count = 0
 
         for record in sorted_records:
             symbol = record["symbol"]
             close = float(record["close"])
             open_price = float(record["open"])
             rolling_sd = rolling_sd_map.get(symbol)
+            rolling_avg_volume = rolling_volume_map.get(symbol)
             prev_close = prev_close_map.get(symbol)
 
             flag_reasons = []
+            checks_run = 0
 
             if rolling_sd is not None and prev_close is not None and prev_close > 0 and open_price > 0:
+                checks_run += 1
                 log_return = abs(math.log(close / prev_close))
                 if log_return > 5 * rolling_sd:
                     flag_reasons.append(
@@ -142,36 +157,69 @@ class OHLCVService:
                         f"open_gap {open_gap:.4f} > 3*sd {3 * rolling_sd:.4f}"
                     )
 
-                # TODO: add rolling_avg_volume to volatility_rolling for volume spike check
+            # Volume spike is independent of prev_close: it needs only today's volume
+            # and the rolling baseline, so it still runs for a symbol with no usable
+            # previous close. The multiple is deliberately loose — a 10x day is a
+            # suspected bad tick, whereas 2-3x is an ordinary earnings session, and an
+            # over-tight threshold here is exactly how the open-gap bug silently
+            # rejected 80% of the universe.
+            if rolling_avg_volume is not None and rolling_avg_volume > 0:
+                checks_run += 1
+                volume = float(record["volume"])
+                if volume > _VOLUME_SPIKE_MULTIPLE * rolling_avg_volume:
+                    flag_reasons.append(
+                        f"volume {volume:.0f} > {_VOLUME_SPIKE_MULTIPLE:.0f}x "
+                        f"avg {rolling_avg_volume:.0f}"
+                    )
+
+            if checks_run == 0:
+                # No baseline yet (new listing, or first run for this symbol). The record
+                # passes, but it passed UNCHECKED — counted separately so a run cannot
+                # report a clean bill of health it never actually earned.
+                unvalidated_count += 1
 
             if flag_reasons:
                 flagged_count += 1
                 error_msg = "; ".join(flag_reasons)
                 try:
-                    self.client._insert(
-                        """
-                        INSERT INTO failed_ingestion
-                            (id, symbol_id, raw_symbol, failure, failure_error,
-                             retry_after, attempts)
-                        SELECT %s, m.id, %s, 'VALIDATION', %s,
-                               NOW() + INTERVAL '1 hour', 1
-                        FROM membership m WHERE m.symbol = %s
-                        ON CONFLICT (symbol_id) DO UPDATE SET
-                            failure = EXCLUDED.failure,
-                            failure_error = EXCLUDED.failure_error,
-                            retry_after = NOW() + INTERVAL '1 hour',
-                            attempts = failed_ingestion.attempts + 1,
-                            review_required = (failed_ingestion.attempts + 1) >= 3,
-                            created_at = NOW()
-                        """,
-                        (str(uuid.uuid4()), symbol, error_msg, symbol),
-                    )
+                    # Savepoint: one symbol's failed DLQ write must not abort the
+                    # transaction and take every other flagged symbol down with it.
+                    with self.client.savepoint("dlq_validation"):
+                        self.client._insert(
+                            """
+                            INSERT INTO failed_ingestion
+                                (id, symbol_id, raw_symbol, failure, failure_error,
+                                 retry_after, attempts)
+                            SELECT %s, m.id, %s, 'VALIDATION', %s,
+                                   NOW() + INTERVAL '1 hour', 1
+                            FROM membership m WHERE m.symbol = %s
+                            ON CONFLICT (symbol_id) DO UPDATE SET
+                                failure = EXCLUDED.failure,
+                                failure_error = EXCLUDED.failure_error,
+                                retry_after = NOW() + INTERVAL '1 hour',
+                                attempts = failed_ingestion.attempts + 1,
+                                review_required = (failed_ingestion.attempts + 1) >= 3,
+                                created_at = NOW()
+                            """,
+                            (str(uuid.uuid4()), symbol, error_msg, symbol),
+                        )
                 except DBError as e:
                     logger.error("Failed to log validation failure for %s: %s", symbol, e)
             else:
                 clean.append(record)
 
-        return {"clean": clean, "flagged_count": flagged_count}
+        if unvalidated_count:
+            logger.warning(
+                "run_statistical_validation: %d of %d records passed with NO statistical "
+                "check (missing rolling baseline or previous close)",
+                unvalidated_count, len(sorted_records),
+            )
+
+        return {
+            "clean": clean,
+            "flagged_count": flagged_count,
+            "unvalidated_count": unvalidated_count,
+        }
 
     def pipeline_end(self, rows_written: int, attempted: Optional[int] = None) -> None:
         """
@@ -273,24 +321,52 @@ class OHLCVService:
 
     def _log_ingestion_failure(self, symbol: str, failure_mode: str, error: str) -> None:
         try:
-            self.client._insert(
-                """
-                INSERT INTO failed_ingestion
-                    (id, symbol_id, raw_symbol, failure, failure_error, retry_after, attempts)
-                SELECT %s, m.id, %s, %s, %s, NOW() + INTERVAL '1 hour', 1
-                FROM membership m WHERE m.symbol = %s
-                ON CONFLICT (symbol_id) DO UPDATE SET
-                    failure = EXCLUDED.failure,
-                    failure_error = EXCLUDED.failure_error,
-                    retry_after = NOW() + INTERVAL '1 hour',
-                    attempts = failed_ingestion.attempts + 1,
-                    review_required = (failed_ingestion.attempts + 1) >= 3,
-                    created_at = NOW()
-                """,
-                (str(uuid.uuid4()), symbol, failure_mode, error, symbol),
-            )
+            # Savepoint: this runs per-symbol inside a chunk loop. Without it, one bad
+            # DLQ write aborts the transaction and every remaining symbol in the chunk
+            # fails too — the failure mode that hid thousands of losses behind a
+            # swallowed exception.
+            with self.client.savepoint("dlq_ingestion"):
+                self.client._insert(
+                    """
+                    INSERT INTO failed_ingestion
+                        (id, symbol_id, raw_symbol, failure, failure_error, retry_after, attempts)
+                    SELECT %s, m.id, %s, %s, %s, NOW() + INTERVAL '1 hour', 1
+                    FROM membership m WHERE m.symbol = %s
+                    ON CONFLICT (symbol_id) DO UPDATE SET
+                        failure = EXCLUDED.failure,
+                        failure_error = EXCLUDED.failure_error,
+                        retry_after = NOW() + INTERVAL '1 hour',
+                        attempts = failed_ingestion.attempts + 1,
+                        review_required = (failed_ingestion.attempts + 1) >= 3,
+                        created_at = NOW()
+                    """,
+                    (str(uuid.uuid4()), symbol, failure_mode, error, symbol),
+                )
         except DBError as e:
             logger.error("Failed to log ingestion failure for %s: %s", symbol, e)
+
+    def _clear_resolved_failures(self, symbols: List[str]) -> None:
+        """
+        Drop DLQ rows for symbols that just landed in the price store.
+
+        failed_ingestion is current-state ("what needs retrying now"), not history, so a
+        resolved failure is deleted outright rather than marked. Without this, `attempts`
+        only ever climbs: three unrelated transient failures months apart would latch
+        review_required and drop a healthy symbol from the retry list permanently.
+        """
+        if not symbols:
+            return
+        try:
+            self.client._update(
+                """
+                DELETE FROM failed_ingestion
+                WHERE symbol_id IN (SELECT id FROM membership WHERE symbol = ANY(%s))
+                """,
+                (symbols,),
+            )
+        except DBError as e:
+            logger.error("_clear_resolved_failures failed: %s", e)
+            raise PipelineDBError("Clearing resolved DLQ rows failed") from e
 
     def fetch_and_validate_chunk(self, chunk: List[str]) -> List[Dict]:
         results = []
@@ -328,13 +404,25 @@ class OHLCVService:
             return 0
         try:
             df = build_dataframe(records)
-            return self.s3.write(df)
+            # s3.write MERGEs on (symbol, date) and delta-rs raises if two source rows
+            # match one target row. That uniqueness was previously incidental — it held
+            # only because build_chunks happens to de-dupe its symbol list. Enforce it
+            # here instead of relying on an upstream accident.
+            df = deduplicate(df)
+            rows_written = self.s3.write(df)
         except S3Error as e:
             logger.error("write_delta failed: %s", e)
             raise PipelineStorageError("Delta Lake write failed") from e
 
+        # Only now are these symbols genuinely resolved: the data is in the price store.
+        # Clearing at fetch time would be wrong — a record can pass fetch and still be
+        # flagged by Layer 4 afterwards. Safe to retry if this raises: s3.write is an
+        # idempotent MERGE, so a re-run rewrites the same rows.
+        self._clear_resolved_failures(df["symbol"].tolist())
+        return rows_written
+
     def update_rolling_volatility(self) -> None:
-        symbols = self.query_active_and_retry_symbols()["symbols"]
+        symbols = self.query_active_symbols()
         if not symbols:
             return
 
@@ -351,15 +439,20 @@ class OHLCVService:
             logger.info("update_rolling_volatility: no symbols had sufficient history")
             return
 
-        rows = [(symbol, sd) for symbol, sd in vol_map.items()]
+        rows = [
+            (symbol, stats["sd"], stats["avg_volume"])
+            for symbol, stats in vol_map.items()
+        ]
         try:
             self.client._upsert(
                 """
-                INSERT INTO volatility_rolling (symbol_id, rolling_sd)
-                SELECT m.id, v.sd::double precision
-                FROM (VALUES %s) AS v(symbol, sd)
+                INSERT INTO volatility_rolling (symbol_id, rolling_sd, rolling_avg_volume)
+                SELECT m.id, v.sd::double precision, v.avg_volume::double precision
+                FROM (VALUES %s) AS v(symbol, sd, avg_volume)
                 JOIN membership m ON m.symbol = v.symbol
-                ON CONFLICT (symbol_id) DO UPDATE SET rolling_sd = EXCLUDED.rolling_sd
+                ON CONFLICT (symbol_id) DO UPDATE SET
+                    rolling_sd = EXCLUDED.rolling_sd,
+                    rolling_avg_volume = EXCLUDED.rolling_avg_volume
                 """,
                 rows,
             )
