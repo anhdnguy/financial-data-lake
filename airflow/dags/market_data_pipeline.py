@@ -51,15 +51,17 @@ def market_data_pipeline():
             service.pipeline_start()
 
     @task
-    def query_active_symbols() -> Dict[str, List]:
+    def query_active_symbols() -> List[str]:
         pipeline_run_id = Variable.get(_VAR_KEY)
         with get_market_data_service("market_data_pipeline", pipeline_run_id) as service:
-            return service.query_active_and_retry_symbols()
+            return service.query_active_symbols()
 
     @task
-    def build_chunks(symbol_payload: Dict[str, List]) -> List[List[str]]:
-        all_symbols = list(set(symbol_payload["symbols"] + symbol_payload["retries"]))
-        return chunk_symbols(all_symbols)
+    def build_chunks(symbols: List[str]) -> List[List[str]]:
+        # The query is SELECT DISTINCT, so no de-duplication is needed here. The
+        # (symbol, date) uniqueness the Delta merge requires is enforced properly in
+        # write_delta via deduplicate(), not as a side effect of this step.
+        return chunk_symbols(symbols)
 
     @task
     def fetch_ohlcv(chunk: List[str]) -> List[Dict]:
@@ -72,7 +74,7 @@ def market_data_pipeline():
         return [row for chunk in chunks_results for row in chunk]
 
     @task
-    def statistical_validation(raw_records: Dict) -> Dict:
+    def statistical_validation(raw_records: List[Dict]) -> Dict:
         pipeline_run_id = Variable.get(_VAR_KEY)
         with get_market_data_service("market_data_pipeline", pipeline_run_id) as service:
             return service.run_statistical_validation(raw_records)
