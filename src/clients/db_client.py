@@ -1,5 +1,9 @@
 import logging
+from contextlib import contextmanager
+from uuid import uuid4
+
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extras import execute_values
 from src.config import AppConfig
 
@@ -43,41 +47,70 @@ class DBClient:
 
     def rollback(self):
         self.connection.rollback()
-        
+
+    @contextmanager
+    def savepoint(self, name: str = "sp"):
+        """
+        Nested rollback point INSIDE the caller's transaction.
+
+        Postgres aborts the whole transaction on any statement error: every later
+        statement fails with "current transaction is aborted" until someone rolls
+        back. That makes "catch the error and carry on" impossible at statement
+        level — which is why these methods used to call connection.rollback()
+        themselves, silently discarding work the service had already staged.
+
+        A savepoint gives per-statement isolation without that: on error only the
+        work since the savepoint is undone, and the surrounding transaction stays
+        usable. The service decides where isolation belongs; the client only
+        exposes the primitive. The name is quoted as an identifier, never
+        interpolated user input.
+        """
+        unique = f"{name}_{uuid4().hex[:8]}"
+        ident = sql.Identifier(unique)
+        self.cursor.execute(sql.SQL("SAVEPOINT {}").format(ident))
+        try:
+            yield
+        except Exception:
+            self.cursor.execute(sql.SQL("ROLLBACK TO SAVEPOINT {}").format(ident))
+            raise
+        else:
+            self.cursor.execute(sql.SQL("RELEASE SAVEPOINT {}").format(ident))
+
     def _insert(self, query: str, data: tuple) -> None:
         if not self.connection or self.connection.closed:
             raise DBError("No active connection")
-        
+
         try:
             self.cursor.execute(query, data)
 
         except psycopg2.Error as e:
-            self.rollback()
+            # No rollback here — transaction control belongs to the service layer's
+            # __exit__. A client-level rollback throws away everything the service
+            # has staged, which is not this method's call to make. Callers that want
+            # to survive a failed statement wrap it in savepoint().
             logger.error("Insert failed — message: %s | sqlstate: %s | position: %s",
                          e.diag.message_primary, e.diag.sqlstate, e.diag.statement_position)
             raise DBQueryError(f"Insert failed: {str(e)}") from e
-        
+
     def _upsert(self, query: str, data: list) -> None:
         if not self.connection or self.connection.closed:
             raise DBError("No active connection")
-        
+
         try:
             execute_values(self.cursor, query, data)
 
         except psycopg2.Error as e:
-            self.rollback()
             raise DBQueryError(f"Upsert failed: {str(e)}") from e
 
 
     def _update(self, query: str, data: tuple) -> None:
         if not self.connection or self.connection.closed:
             raise DBError("No active connection")
-        
+
         try:
             self.cursor.execute(query, data)
-        
+
         except psycopg2.Error as e:
-            self.rollback()
             raise DBQueryError(f"Update failed: {str(e)}") from e
 
     def _select(self, query: str, data: tuple = None) -> list[tuple]:
