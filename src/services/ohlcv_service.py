@@ -129,14 +129,14 @@ class OHLCVService:
 
             flag_reasons = []
 
-            if rolling_sd is not None and prev_close is not None and prev_close > 0:
+            if rolling_sd is not None and prev_close is not None and prev_close > 0 and open_price > 0:
                 log_return = abs(math.log(close / prev_close))
                 if log_return > 5 * rolling_sd:
                     flag_reasons.append(
                         f"log_return {log_return:.4f} > 5*sd {5 * rolling_sd:.4f}"
                     )
 
-                open_gap = abs(open_price - prev_close)
+                open_gap = abs(math.log(open_price / prev_close))
                 if open_gap > 3 * rolling_sd:
                     flag_reasons.append(
                         f"open_gap {open_gap:.4f} > 3*sd {3 * rolling_sd:.4f}"
@@ -173,7 +173,16 @@ class OHLCVService:
 
         return {"clean": clean, "flagged_count": flagged_count}
 
-    def pipeline_end(self, rows_written: int) -> None:
+    def pipeline_end(self, rows_written: int, attempted: Optional[int] = None) -> None:
+        """
+        Close out the run. `attempted` is how many symbols the run set out to fetch;
+        None means that number was unavailable (log_pipeline_end runs under
+        trigger_rule="all_done", so upstream may have handed it nothing).
+
+        Status is derived from the run's OWN numbers, never from the DLQ count. A DLQ
+        that silently refuses its writes reads as zero failures — which is how five
+        consecutive runs reported SUCCESS while the write shrank from 3010 to 614.
+        """
         try:
             rows = self.client._select(
                 "SELECT started_at FROM pipeline_run WHERE id = %s",
@@ -189,12 +198,32 @@ class OHLCVService:
                 )
                 failure_count = count_rows[0][0] if count_rows else 0
 
-            if rows_written > 0 and failure_count == 0:
-                status = "SUCCESS"
-            elif rows_written > 0:
+            # The DLQ count is now a cross-check, not a status input.
+            if attempted is not None:
+                records_failed = max(attempted - rows_written, 0)
+                if records_failed != failure_count:
+                    logger.warning(
+                        "pipeline_end: DLQ recorded %d failures but %d symbols are "
+                        "missing from the write (attempted=%d, written=%d) — the DLQ "
+                        "is not capturing every failure",
+                        failure_count, records_failed, attempted, rows_written,
+                    )
+            else:
+                logger.warning(
+                    "pipeline_end: attempted count unavailable — falling back to the "
+                    "DLQ count, which may under-report"
+                )
+                records_failed = failure_count
+
+            if rows_written == 0:
+                status = "FAILED"
+            elif attempted is None:
+                # No honest denominator; best effort on the DLQ count alone.
+                status = "SUCCESS" if failure_count == 0 else "PARTIAL"
+            elif rows_written < attempted or failure_count > 0:
                 status = "PARTIAL"
             else:
-                status = "FAILED"
+                status = "SUCCESS"
 
             self.client._update(
                 """
@@ -203,7 +232,7 @@ class OHLCVService:
                     records_processed = %s, records_failed = %s
                 WHERE id = %s
                 """,
-                (status, rows_written, failure_count, self.pipeline_run_id),
+                (status, rows_written, records_failed, self.pipeline_run_id),
             )
         except DBError as e:
             logger.error("pipeline_end failed: %s", e)

@@ -92,12 +92,16 @@ def market_data_pipeline():
             service.update_rolling_volatility()
 
     @task(trigger_rule="all_done")
-    def log_pipeline_end(rows_written: int) -> None:
+    def log_pipeline_end(rows_written: int, chunks: List[List[str]]) -> None:
         pipeline_run_id = Variable.get(_VAR_KEY)
         if rows_written is None:
             rows_written = 0
+        # all_done: upstream may have failed before producing chunks. Without a chunk
+        # list there is no honest denominator, so leave attempted unknown rather than
+        # inventing a zero that would read as a clean run.
+        attempted = sum(len(chunk) for chunk in chunks) if chunks else None
         with get_market_data_service("market_data_pipeline", pipeline_run_id) as service:
-            service.pipeline_end(rows_written)
+            service.pipeline_end(rows_written, attempted)
 
     # ------------------------------------------------------------------ #
     # Task wiring                                                          #
@@ -121,7 +125,7 @@ def market_data_pipeline():
     rows_written = write_to_delta_lake(validated)
 
     volatility_task = update_volatility(rows_written)
-    pipeline_end_task = log_pipeline_end(rows_written)
+    pipeline_end_task = log_pipeline_end(rows_written, chunks)
     volatility_task >> pipeline_end_task >> end
 
 
