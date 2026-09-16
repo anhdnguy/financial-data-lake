@@ -99,14 +99,18 @@ class S3DeltaClient:
         before: date | None = None
     ) -> pd.DataFrame:
         """
-        Read recent (symbol, date, close) rows for the given symbols. Prunes to the
-        current + previous year partitions, filter the subset of symbols, sort by symbol
-        and date, and trim based on the lookback days.
+        Read recent (symbol, date, close, volume) rows for the given symbols. Prunes to
+        the current + previous year partitions, filter the subset of symbols, sort by
+        symbol and date, and trim based on the lookback days.
+
+        `volume` rides along because compute_rolling_volatility needs the volume average
+        over the same window as the return std — both stats land in one
+        volatility_rolling row, so fetching them in one read keeps them consistent.
 
         Raises S3ReadError if the table does not exist yet (first ever run).
         """
         if not symbols:
-            return pd.DataFrame(columns=["symbol", "date", "close"])
+            return pd.DataFrame(columns=["symbol", "date", "close", "volume"])
 
         current_year = date.today().year
         years = [str(current_year), str(current_year - 1)]
@@ -114,7 +118,7 @@ class S3DeltaClient:
         try:
             dt = DeltaTable(self._uri, storage_options=self._storage_options)
             df = dt.to_pandas(
-                columns=["symbol", "date", "close", "year"],
+                columns=["symbol", "date", "close", "volume", "year"],
                 partitions=[("year", "in", years)],
             )
         except TableNotFoundError as e:
@@ -127,7 +131,7 @@ class S3DeltaClient:
         if before:
             df = df[df["date"] < pd.Timestamp(before)]
         df = df.groupby("symbol").tail(lookback)
-        return df[["symbol", "date", "close"]]
+        return df[["symbol", "date", "close", "volume"]]
 
     def optimize(self, target_size: Optional[int] = None) -> Dict:
         """
