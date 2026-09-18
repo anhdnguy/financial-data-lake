@@ -26,9 +26,16 @@ from src.transform.universe_transform import _get_today
 
 logger = logging.getLogger(__name__)
 
-# Layer-4 volume spike: today's volume against the 20-day average. Loose on purpose —
-# this is a bad-tick filter, not a signal. Earnings and index rebalances routinely move
-# 3-5x; 10x is the range where a data error is more likely than a real session.
+# Layer-4 limits. Layer 4 ANNOTATES, it never rejects: a bar past a limit is still
+# written to the price store, and a row goes to ohlcv_flag recording the metric beside
+# the limit it crossed. Layers 1-3 (schwab_client) remain the only rejecting gates.
+#
+# Returns and the open gap are log ratios measured in units of the ticker's own daily
+# log-return std, so the limits scale with how volatile the name normally is.
+_LOG_RETURN_SIGMA = 5.0
+_OPEN_GAP_SIGMA = 3.0
+# Volume against the 20-day average. Loose on purpose: earnings and index rebalances
+# routinely run 3-5x; 10x is where a data error is more likely than a real session.
 _VOLUME_SPIKE_MULTIPLE = 10.0
 
 
@@ -96,8 +103,19 @@ class OHLCVService:
         return [row[0] for row in active_rows]
 
     def run_statistical_validation(self, raw_records: List[Dict]) -> Dict:
+        """
+        Layer 4 — annotate, never reject.
+
+        Every record is returned for writing. Records that cross a Layer-4 limit are
+        recorded in ohlcv_flag with their metrics and the limits applied. Rejecting on
+        a statistical judgment destroyed data irreversibly (the rejected bar was never
+        stored) and imposed one definition of "outlier" on every future consumer.
+        Cleaning is a downstream concern; this layer's job is to leave an honest,
+        point-in-time note — computed only from the sessions BEFORE the bar, so a
+        backtest reading the flag cannot pick up look-ahead bias from it.
+        """
         if not raw_records:
-            return {"clean": [], "flagged_count": 0, "unvalidated_count": 0}
+            return {"records": [], "flagged_count": 0, "unvalidated_count": 0}
 
         symbols = list({r["symbol"] for r in raw_records})
         session_date = min(r["date"] for r in raw_records)
@@ -128,98 +146,123 @@ class OHLCVService:
             logger.warning("run_statistical_validation: no Delta history yet: %s", e)
             prev_close_map = {}
 
-        clean = []
-        flagged_count = 0
+        flags = []
         unvalidated_count = 0
 
         for record in sorted_records:
             symbol = record["symbol"]
             close = float(record["close"])
             open_price = float(record["open"])
+            volume = int(record["volume"])
             rolling_sd = rolling_sd_map.get(symbol)
             rolling_avg_volume = rolling_volume_map.get(symbol)
             prev_close = prev_close_map.get(symbol)
 
-            flag_reasons = []
+            rules = []
             checks_run = 0
+            log_return = log_return_limit = open_gap = open_gap_limit = volume_limit = None
 
             if rolling_sd is not None and prev_close is not None and prev_close > 0 and open_price > 0:
                 checks_run += 1
-                log_return = abs(math.log(close / prev_close))
-                if log_return > 5 * rolling_sd:
-                    flag_reasons.append(
-                        f"log_return {log_return:.4f} > 5*sd {5 * rolling_sd:.4f}"
-                    )
+                # Stored signed (direction of the move); the rule compares magnitude.
+                log_return = math.log(close / prev_close)
+                log_return_limit = _LOG_RETURN_SIGMA * rolling_sd
+                if abs(log_return) > log_return_limit:
+                    rules.append("log_return")
 
-                open_gap = abs(math.log(open_price / prev_close))
-                if open_gap > 3 * rolling_sd:
-                    flag_reasons.append(
-                        f"open_gap {open_gap:.4f} > 3*sd {3 * rolling_sd:.4f}"
-                    )
+                open_gap = math.log(open_price / prev_close)
+                open_gap_limit = _OPEN_GAP_SIGMA * rolling_sd
+                if abs(open_gap) > open_gap_limit:
+                    rules.append("open_gap")
 
             # Volume spike is independent of prev_close: it needs only today's volume
             # and the rolling baseline, so it still runs for a symbol with no usable
-            # previous close. The multiple is deliberately loose — a 10x day is a
-            # suspected bad tick, whereas 2-3x is an ordinary earnings session, and an
-            # over-tight threshold here is exactly how the open-gap bug silently
-            # rejected 80% of the universe.
+            # previous close.
             if rolling_avg_volume is not None and rolling_avg_volume > 0:
                 checks_run += 1
-                volume = float(record["volume"])
-                if volume > _VOLUME_SPIKE_MULTIPLE * rolling_avg_volume:
-                    flag_reasons.append(
-                        f"volume {volume:.0f} > {_VOLUME_SPIKE_MULTIPLE:.0f}x "
-                        f"avg {rolling_avg_volume:.0f}"
-                    )
+                volume_limit = _VOLUME_SPIKE_MULTIPLE * rolling_avg_volume
+                if volume > volume_limit:
+                    rules.append("volume_spike")
 
             if checks_run == 0:
                 # No baseline yet (new listing, or first run for this symbol). The record
-                # passes, but it passed UNCHECKED — counted separately so a run cannot
-                # report a clean bill of health it never actually earned.
+                # is written, but it was never checked — counted separately so a run
+                # cannot report a clean bill of health it never actually earned.
                 unvalidated_count += 1
 
-            if flag_reasons:
-                flagged_count += 1
-                error_msg = "; ".join(flag_reasons)
-                try:
-                    # Savepoint: one symbol's failed DLQ write must not abort the
-                    # transaction and take every other flagged symbol down with it.
-                    with self.client.savepoint("dlq_validation"):
-                        self.client._insert(
-                            """
-                            INSERT INTO failed_ingestion
-                                (id, symbol_id, raw_symbol, failure, failure_error,
-                                 retry_after, attempts)
-                            SELECT %s, m.id, %s, 'VALIDATION', %s,
-                                   NOW() + INTERVAL '1 hour', 1
-                            FROM membership m WHERE m.symbol = %s
-                            ON CONFLICT (symbol_id) DO UPDATE SET
-                                failure = EXCLUDED.failure,
-                                failure_error = EXCLUDED.failure_error,
-                                retry_after = NOW() + INTERVAL '1 hour',
-                                attempts = failed_ingestion.attempts + 1,
-                                review_required = (failed_ingestion.attempts + 1) >= 3,
-                                created_at = NOW()
-                            """,
-                            (str(uuid.uuid4()), symbol, error_msg, symbol),
-                        )
-                except DBError as e:
-                    logger.error("Failed to log validation failure for %s: %s", symbol, e)
-            else:
-                clean.append(record)
+            if rules:
+                flags.append((
+                    symbol, record["date"], self.pipeline_run_id, rules, prev_close,
+                    log_return, log_return_limit, open_gap, open_gap_limit,
+                    volume, volume_limit, rolling_sd, rolling_avg_volume,
+                ))
 
+        self._write_flags(symbols, session_date, flags)
+
+        if flags:
+            logger.info(
+                "run_statistical_validation: %d of %d records flagged in ohlcv_flag "
+                "(written to the price store regardless)",
+                len(flags), len(sorted_records),
+            )
         if unvalidated_count:
             logger.warning(
-                "run_statistical_validation: %d of %d records passed with NO statistical "
+                "run_statistical_validation: %d of %d records had NO statistical "
                 "check (missing rolling baseline or previous close)",
                 unvalidated_count, len(sorted_records),
             )
 
         return {
-            "clean": clean,
-            "flagged_count": flagged_count,
+            "records": sorted_records,
+            "flagged_count": len(flags),
             "unvalidated_count": unvalidated_count,
         }
+
+    def _write_flags(self, symbols: List[str], session_date: str, flags: List[tuple]) -> None:
+        """
+        Replace this session's Layer-4 flags for these symbols with the current
+        evaluation. Delete-then-insert rather than upsert, so a re-run that no longer
+        flags a bar also removes the stale row. Batches are always a single session
+        (see session_date in run_statistical_validation).
+
+        Failure raises rather than being swallowed. A flag write is the kind of
+        annotation that can fail silently for weeks — the DLQ's ON CONFLICT writes did
+        exactly that when their index was missing. Losing flags quietly would leave
+        reports trusting data that was known to be abnormal.
+        """
+        try:
+            self.client._update(
+                """
+                DELETE FROM ohlcv_flag
+                WHERE session_date = %s::date
+                  AND symbol_id IN (SELECT id FROM membership WHERE symbol = ANY(%s))
+                """,
+                (session_date, symbols),
+            )
+            if not flags:
+                return
+            self.client._upsert(
+                """
+                INSERT INTO ohlcv_flag
+                    (symbol_id, session_date, pipeline_run_id, rules, prev_close,
+                     log_return, log_return_limit, open_gap, open_gap_limit,
+                     volume, volume_limit, rolling_sd, rolling_avg_volume)
+                SELECT m.id, v.session_date::date, v.pipeline_run_id::uuid, v.rules::text[],
+                       v.prev_close::double precision,
+                       v.log_return::double precision, v.log_return_limit::double precision,
+                       v.open_gap::double precision, v.open_gap_limit::double precision,
+                       v.volume::bigint, v.volume_limit::double precision,
+                       v.rolling_sd::double precision, v.rolling_avg_volume::double precision
+                FROM (VALUES %s) AS v(symbol, session_date, pipeline_run_id, rules, prev_close,
+                                      log_return, log_return_limit, open_gap, open_gap_limit,
+                                      volume, volume_limit, rolling_sd, rolling_avg_volume)
+                JOIN membership m ON m.symbol = v.symbol
+                """,
+                flags,
+            )
+        except DBError as e:
+            logger.error("_write_flags failed: %s", e)
+            raise PipelineDBError("Writing Layer-4 flags failed") from e
 
     def pipeline_end(self, rows_written: int, attempted: Optional[int] = None) -> None:
         """

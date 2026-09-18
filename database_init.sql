@@ -54,6 +54,38 @@ create table if not exists failed_ingestion (
 	review_required bool default False
 );
 
+-- >>> ohlcv_flag (added 2026-09-18)
+-- Layer-4 annotations: bars that landed in the price store but looked abnormal.
+-- Layer 4 never rejects a bar; it records here instead, so report authors can see
+-- which data points were unusual without the raw store losing anything.
+-- One row per flagged (symbol, session). Each metric is stored beside the LIMIT it
+-- was compared against that day: volatility_rolling only holds today's value, so
+-- without this the "what counted as normal then" context would be lost.
+-- log_return / open_gap are SIGNED (direction of the move); the rule compares
+-- their absolute value to the limit. Rows are replaced, never updated: a re-run
+-- deletes the session's flags for its symbols and writes the current evaluation.
+CREATE TABLE IF NOT EXISTS ohlcv_flag (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    symbol_id UUID NOT NULL REFERENCES membership(id),
+    session_date DATE NOT NULL,
+    pipeline_run_id UUID,               -- provenance only; no FK, a run row may be removed
+    rules TEXT[] NOT NULL,              -- which rules tripped: log_return / open_gap / volume_spike
+    prev_close DOUBLE PRECISION,        -- the reference price the returns were measured from
+    log_return DOUBLE PRECISION,
+    log_return_limit DOUBLE PRECISION,
+    open_gap DOUBLE PRECISION,
+    open_gap_limit DOUBLE PRECISION,
+    volume BIGINT,
+    volume_limit DOUBLE PRECISION,
+    rolling_sd DOUBLE PRECISION,
+    rolling_avg_volume DOUBLE PRECISION,
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE (symbol_id, session_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ohlcv_flag_session ON ohlcv_flag(session_date);
+-- <<< ohlcv_flag
+
 -- Pipeline Run Log
 CREATE TABLE IF NOT EXISTS pipeline_run (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

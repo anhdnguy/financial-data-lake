@@ -34,7 +34,7 @@ def on_failure_callback(context):
 
 @dag(
     "market_data_pipeline",
-    schedule="30 6 * * 2-6",  # 5:30 AM UTC = 11:30 PM PST, weekdays only
+    schedule="30 6 * * 2-6",  # 06:30 UTC Tue-Sat (11:30 PM Pacific in summer, 10:30 PM in winter)
     default_args=default_args,
     catchup=False,
     tags=["financial_data_lake", "ETL", "ohlcv"],
@@ -83,7 +83,7 @@ def market_data_pipeline():
     def write_to_delta_lake(validated_payload: Dict) -> int:
         pipeline_run_id = Variable.get(_VAR_KEY)
         with get_market_data_service("market_data_pipeline", pipeline_run_id) as service:
-            return service.write_delta(validated_payload["clean"])
+            return service.write_delta(validated_payload["records"])
 
     @task
     def update_volatility(rows_written: int) -> None:

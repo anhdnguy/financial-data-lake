@@ -43,8 +43,10 @@ data-quality gates.
 ## Features
 
 - **Daily EOD OHLCV ingestion** from the Schwab `/pricehistory` API for the Russell 3000.
-- **Four-layer data validation** — HTTP, field presence, internal consistency, and a
-  statistical 5-sigma outlier gate using per-ticker rolling volatility.
+- **Four-layer data validation** — three structural gates (HTTP + session date, field
+  presence, internal consistency) that reject malformed bars, plus a statistical layer
+  that **annotates rather than rejects**: abnormal bars are stored and flagged in
+  `ohlcv_flag` with the metrics and the limits applied that day.
 - **Delta Lake price store** (ACID, year-partitioned) on S3 via `delta-rs` — no Spark.
 - **PostgreSQL metadata store** — universe membership, rolling volatility, a dead-letter
   queue, and an operational audit log.
@@ -168,7 +170,7 @@ financial-data-lake/
 │   ├── create_bucket.sh               # one-time LocalStack bucket provisioning
 │   └── setup_python.sh                # local interpreter/env helper
 ├── stock_csv/tickers_sample.csv       # universe seed sample (real tickers.csv gitignored)
-├── database_init.sql                  # schema: 7 tables + indexes + triggers
+├── database_init.sql                  # schema: 8 tables + indexes + triggers
 ├── docker-compose.yaml                # data plane (ohlcv-db, ohlcv-redis) + Airflow stack
 ├── setup.yaml                         # conda environment definition
 └── .env.example                       # configuration template
@@ -186,8 +188,9 @@ PostgreSQL schema (`database_init.sql`), database `ohlcv`:
 | `membership` | Symbol registry — **never deleted** |
 | `universe_membership` | Symbol ↔ universe with `enter_date` / `exit_date`, delisted reason |
 | `volatility_rolling` | Per-ticker rolling stats — `rolling_sd` (daily log-return std) and `rolling_avg_volume`, one row per symbol, both used by Layer 4 |
-| `failed_ingestion` | Dead-letter queue — `failure_mode` (`HTTP_ERROR` \| `VALIDATION`), `attempts`, `review_required`. **Current-state, one row per symbol** (unique on `symbol_id`); the row is deleted once the symbol reaches the price store |
+| `failed_ingestion` | Dead-letter queue — symbols for which **no usable bar** could be obtained (Layers 1–3 only). `failure_mode` (`HTTP_ERROR` \| `VALIDATION`), `attempts`, `review_required`. **Current-state, one row per symbol** (unique on `symbol_id`); the row is deleted once the symbol reaches the price store |
 | `pipeline_run` | Operational audit log — status `RUNNING` \| `SUCCESS` \| `FAILED` \| `PARTIAL` |
+| `ohlcv_flag` | Layer-4 annotations — one row per flagged (symbol, session): which rules tripped, the signed log return / open gap and volume, and the **limit each was compared against that day**. The bar itself is always in the price store |
 | `schwab_token` | Durable Schwab refresh token — one row per provider (`UNIQUE`), `issued_at` anchors the 7-day expiry wall |
 
 Highlights: a partial unique index enforces one active membership per symbol per universe
@@ -212,7 +215,7 @@ Nine tasks, with `fetch_ohlcv` fanned out via dynamic task mapping for concurren
 log_pipeline_start → query_active_symbols → build_chunks
         → fetch_ohlcv (mapped per chunk)        # rate-limited Schwab fetch + validation 1–3
         → aggregate_results                      # flatten the mapped chunk results
-        → statistical_validation                 # layer 4: outlier + volume gate
+        → statistical_validation                 # layer 4: flag abnormal bars, keep them all
         → write_to_delta_lake                    # build frame, dedup, year-partitioned merge
         → update_volatility                      # recompute rolling stats → PostgreSQL
         → log_pipeline_end                       # SUCCESS / PARTIAL / FAILED
@@ -257,26 +260,41 @@ DB, never XCom.
 
 ## OHLCV Validation
 
-Every candle passes four layers before it is persisted:
+Layers 1–3 decide whether a response **is a bar at all**; Layer 4 records whether a bar
+**looks unusual**. Only the first kind of question can reject data.
 
 | Layer | Check | On failure |
 |-------|-------|-----------|
 | 1 — HTTP | Status 200, non-empty body, candle date == last NYSE session | Raise / DLQ |
 | 2 — Fields | `open/high/low/close/volume` present and positive | DLQ (`VALIDATION`) |
 | 3 — Consistency | `high ≥ open,close,low` and `low ≤ open,close` | DLQ (`VALIDATION`) |
-| 4 — Statistical | 5σ log return, 3σ open-vs-prev-close gap, 10× volume spike | DLQ (`VALIDATION`) |
+| 4 — Statistical | 5σ log return, 3σ open-vs-prev-close gap, 10× volume spike | **Bar kept**; row in `ohlcv_flag` |
+
+**Why Layer 4 annotates instead of rejecting.** Rejecting on a statistical judgment
+destroyed data irreversibly — the rejected bar was never stored — and forced one
+definition of "outlier" on every future consumer (a momentum model *wants* the 40%
+move; a risk model wants it flagged). It also trapped real moves: once a genuine jump
+was rejected, the stored previous close stayed stale and every later day was rejected
+against it. The price store now records what the source said; cleaning is left to
+downstream consumers, who get an honest note of what looked abnormal.
+
+The flag is computed **only from sessions before the bar**, so it is point-in-time safe
+for backtests. Cleaning the full history after the fact often isn't: centred windows, or
+spotting a bad tick because "it reverted the next day", quietly use future data
+(look-ahead bias).
 
 Layer 4 uses each ticker's **daily** log-return standard deviation (`rolling_sd`, sample
 `ddof=1`) as the threshold on a single-day log return — so the stored volatility is
 deliberately *not* annualized. Both the return and the gap are measured as **log ratios**,
 matching `rolling_sd`'s units: comparing a dollar difference against a dimensionless
-standard deviation is a units error that silently rejects most of the universe.
+standard deviation is a units error that would flag most of the universe (when Layer 4
+still rejected, it silently dropped 80% of it).
 
-The volume multiple (10×) is deliberately loose — this is a bad-tick filter, and earnings
+The volume multiple (10×) is deliberately loose — this flags suspected bad ticks, and earnings
 or index rebalances routinely run 3–5× without the price data being wrong.
 
 A symbol with no rolling baseline yet (a recent listing, or the first run for that ticker)
-has **no** statistical check applied. Those records pass, but are counted separately as
+has **no** statistical check applied. Those records are written, but counted separately as
 `unvalidated_count` so a run cannot report a clean bill of health it never earned.
 
 ---
