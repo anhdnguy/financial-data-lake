@@ -14,9 +14,8 @@
 A production-shaped data engineering project: it ingests daily price data for the top
 US equities, validates it through four layers, stores price history in **Delta Lake on
 S3** and operational metadata in **PostgreSQL**, and orchestrates everything with
-**Apache Airflow**. It is Phase 1 of a longer quant-developer roadmap, with an emphasis
-on doing data engineering *correctly* — clean layering, idempotent writes, and explicit
-data-quality gates.
+**Apache Airflow**. The emphasis is on doing data engineering *correctly* — clean
+layering, idempotent writes, and explicit data-quality gates.
 
 ---
 
@@ -104,7 +103,7 @@ numbers per symbol (`rolling_sd`, `rolling_avg_volume`) are written to PostgreSQ
 ┌───────────────────────  shared-network (external)  ─────────────────────┐
 │                                                                          │
 │   ohlcv-db            ohlcv-redis               LocalStack (S3)          │
-│   (PostgreSQL)        (token cache + lock)      (separate compose)       │
+│   (PostgreSQL)        (cache · lock · limiter)  (separate compose)       │
 │                                                                          │
 │   Airflow — apiserver · scheduler · dag-processor · triggerer            │
 │      │      (LocalExecutor; also on this repo's private airflow-net)     │
@@ -190,7 +189,7 @@ PostgreSQL schema (`database_init.sql`), database `ohlcv`:
 | `universe_membership` | Symbol ↔ universe with `enter_date` / `exit_date`, delisted reason |
 | `volatility_rolling` | Per-ticker rolling stats — `rolling_sd` (daily log-return std) and `rolling_avg_volume`, one row per symbol, both used by Layer 4 |
 | `failed_ingestion` | Dead-letter queue — symbols for which **no usable bar** could be obtained (Layers 1–3 only). `failure` (enum `failure_mode`: `HTTP_ERROR` \| `VALIDATION`), `failure_error`, `attempts`, `review_required` (set at 3 attempts). **Current-state, one row per symbol** (unique on `symbol_id`); the row is deleted once the symbol reaches the price store |
-| `pipeline_run` | Operational audit log — status `RUNNING` \| `SUCCESS` \| `FAILED` \| `PARTIAL` |
+| `pipeline_run` | Operational audit log — status `RUNNING` \| `SUCCESS` \| `FAILED` \| `PARTIAL`. Written by `universe_maintenance` and `market_data_pipeline` only; the two maintenance DAGs log nothing here |
 | `ohlcv_flag` | Layer-4 annotations — one row per flagged (symbol, session): which rules tripped, the signed log return / open gap and volume, and the **limit each was compared against that day**. The bar itself is always in the price store |
 | `schwab_token` | Durable Schwab refresh token — one row per provider (`UNIQUE`), `issued_at` anchors the 7-day expiry wall |
 
@@ -228,11 +227,17 @@ log_pipeline_start → query_active_symbols → build_chunks
 Each fetch asks `/pricehistory` for one year of daily candles and keeps only the newest
 one. The schedule sits well after the close because Schwab publishes a session's daily
 bar some hours later: a run at ~01:20 UTC still saw the previous session as newest and
-failed Layer 1 for every symbol. `update_volatility` is skipped when nothing was
+failed Layer 1 for every symbol. `update_volatility` does nothing when no rows were
 written, and `log_pipeline_end` runs even when upstream tasks fail (`all_done`), so
 every run is closed out in `pipeline_run`.
 
-A DAG-level `on_failure_callback` marks the run `FAILED`. Symbols that fail fetch or
+That close-out is what normally records a failed run: with nothing written,
+`log_pipeline_end` sets `FAILED` itself and leaves `notes` empty. The DAG-level
+`on_failure_callback` is a backstop — it sets `FAILED` and stores the error in `notes`,
+but only fires when Airflow marks the DAG run itself as failed, which the `all_done`
+close-out usually prevents.
+
+Symbols that fail fetch or
 validation are written to the `failed_ingestion` dead-letter queue rather than silently
 dropped, and their rows are deleted once the symbol next reaches the price store.
 Failures that are not about one symbol — an expired refresh token, a failed token
@@ -262,7 +267,7 @@ daily merges create) then `VACUUM` (physical deletion of tombstoned files older 
 not a business data-retention knob — `VACUUM` never touches the current table version,
 so the 20-day volatility lookback is unaffected.
 
-### `xcom_cleanup` (weekly, Sundays)
+### `xcom_cleanup` (weekly, Sundays 01:00 UTC)
 XComs are ephemeral inter-task plumbing, and the daily pipeline pushes sizeable
 aggregate/validation payloads through them — left alone, the `xcom` table grows without
 bound. This DAG purges rows older than 30 days through the sanctioned
@@ -329,12 +334,16 @@ symbol with rolling stats but no previous close still gets that one.
   docker network create shared-network   # if it does not already exist
   ```
 
-### 1. Environment
+### 1. Environment (host-side runs only)
 
 ```bash
 conda env create -f setup.yaml
 conda activate financial_data_lake
 ```
+
+The Compose stack does not use this environment — the Airflow image carries its own
+copy of the dependencies (`airflow/requirements.txt`). You need it only to run project
+code on the host.
 
 ### 2. Configuration
 
@@ -411,14 +420,16 @@ wall, every chunk aborts with `SchwabAuthExpiredError` until you do.
 
 ## Configuration
 
-All configuration is loaded from `.env` by `AppConfig` (`src/config/config.py`). See
+`AppConfig` (`src/config/config.py`) reads plain environment variables — it does not
+open `.env` itself. Inside the stack, Compose injects `.env` into every Airflow container
+(`env_file`); on the host, export it first (`set -a; source .env; set +a`). See
 [`.env.example`](.env.example) for the full template.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DB_USER` / `DB_PASSWORD` / `DB_DB` | PostgreSQL credentials + database | — |
 | `DB_HOSTNAME` | DB host (`ohlcv-db` in-network, `localhost` from host); port is fixed at 5432 | `localhost` |
-| `REDIS_HOST` / `REDIS_PORT` | Redis token cache + lock | `localhost` / `6379` |
+| `REDIS_HOST` / `REDIS_PORT` | Redis token cache, refresh lock and rate limiter | `localhost` / `6379` |
 | `SCHWAB_CLIENT_ID` / `SCHWAB_CLIENT_SECRET` | Schwab OAuth client credentials | — |
 | `SCHWAB_BASE_URL` | Schwab API base URL | `https://api.schwabapi.com` |
 | `SCHWAB_CALLS_PER_MIN` | Rate limiter: long-run **average** call rate | `109` |
@@ -466,6 +477,7 @@ install `apache-airflow==3.1.8` into the environment first (with Airflow's const
 file):
 
 ```bash
+set -a; source .env; set +a          # AppConfig reads the environment, not .env
 export AIRFLOW_HOME=$(pwd)/airflow
 export PYTHONPATH=$(pwd)
 airflow standalone
@@ -577,7 +589,7 @@ to compact the daily files and reap the resulting tombstones.
 - [ ] Automated test suite (framework not yet chosen — see [Testing](#testing))
 - [ ] Backfill of missed sessions (see [Known Limitations](#known-limitations))
 - [ ] Automated universe refresh from the iShares IWV holdings file
-- [ ] Point-in-time correctness / historical constituent snapshots (later phase)
+- [ ] Point-in-time correctness / historical constituent snapshots
 
 ---
 
@@ -610,5 +622,5 @@ pure, no mocks required.
 
 ## License
 
-This is a personal learning project (Phase 1 of a multi-month quant-developer roadmap).
-No formal license is attached and it is not intended for redistribution or production use.
+No formal license is attached. This project is not intended for redistribution or
+production use.
