@@ -9,7 +9,7 @@
 ![Delta Lake](https://img.shields.io/badge/Delta%20Lake-delta--rs-00ADD8)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
 ![LocalStack](https://img.shields.io/badge/LocalStack-S3-7B42BC)
-![Status](https://img.shields.io/badge/status-complete-blue)
+![Status](https://img.shields.io/badge/status-active-green)
 
 A production-shaped data engineering project: it ingests daily price data for the top
 US equities, validates it through four layers, stores price history in **Delta Lake on
@@ -34,6 +34,7 @@ data-quality gates.
 - [Running the Pipelines](#running-the-pipelines)
 - [Storage Layout](#storage-layout)
 - [Design Decisions](#design-decisions)
+- [Known Limitations](#known-limitations)
 - [Roadmap](#roadmap)
 - [Testing](#testing)
 - [License](#license)
@@ -49,7 +50,7 @@ data-quality gates.
   `ohlcv_flag` with the metrics and the limits applied that day.
 - **Delta Lake price store** (ACID, year-partitioned) on S3 via `delta-rs` — no Spark.
 - **PostgreSQL metadata store** — universe membership, rolling volatility, a dead-letter
-  queue, and an operational audit log.
+  queue, Layer-4 flags, the Schwab refresh token, and an operational audit log.
 - **Survivorship-bias-aware universe maintenance** — delisted symbols are soft-deleted
   (an `exit_date` is set), never hard-deleted.
 - **Two-tier Schwab token management** — short-lived access token cached in Redis,
@@ -59,7 +60,7 @@ data-quality gates.
   across all concurrent workers (~109 calls/min, burst of 1), with exponential-backoff
   429 handling that honors `Retry-After`. The limiter **fails closed**: no token, no call.
 - **Delta Lake maintenance DAG** — periodic `OPTIMIZE` (small-file compaction) +
-  `VACUUM` (tombstone cleanup) keeps the table healthy as daily appends accumulate.
+  `VACUUM` (tombstone cleanup) keeps the table healthy as daily merges accumulate.
 - **Resilient external calls** — failed symbols routed to a dead-letter queue, not
   dropped, and cleared from it once they land in the price store; terminal vs. transient
   refresh failures are classified distinctly.
@@ -89,12 +90,12 @@ Transform layer      pure functions (no I/O) — imported directly by tasks and 
 
 | Data | Store | Why |
 |------|-------|-----|
-| OHLCV price history (large, append-only) | **Delta Lake on S3** | Cheap columnar storage, ACID appends, scales |
-| Membership, volatility, DLQ, audit log (small, relational) | **PostgreSQL** | Transactions, joins, point-in-time queries |
+| OHLCV price history (large, one row per symbol per session) | **Delta Lake on S3** | Cheap columnar storage, ACID merges, scales |
+| Membership, volatility, DLQ, flags, audit log, refresh token (small, relational) | **PostgreSQL** | Transactions, joins, point-in-time queries |
 
-Derived facts flow from the price store back to metadata: rolling volatility is
-*computed* from the last 21 closes read out of Delta Lake, and only the resulting scalar
-is written to PostgreSQL.
+Derived facts flow from the price store back to metadata: the rolling stats are
+*computed* from the last 21 sessions read out of Delta Lake, and only the resulting two
+numbers per symbol (`rolling_sd`, `rolling_avg_volume`) are written to PostgreSQL.
 
 **Runtime topology** — services communicate over an external Docker network,
 `shared-network`:
@@ -130,7 +131,7 @@ runs as a separate Compose project attached to the same `shared-network`.
 | Object storage | LocalStack S3 in dev (AWS S3 in prod) |
 | Token cache / lock / rate limiter | Redis (`SET NX` lock, atomic Lua token bucket) |
 | Data source | Schwab API (`/pricehistory`) + CSV universe seed |
-| Data processing | pandas, NumPy |
+| Data processing | pandas, NumPy, `pandas_market_calendars` (NYSE session calendar) |
 | Infra | Docker Compose |
 
 ---
@@ -188,7 +189,7 @@ PostgreSQL schema (`database_init.sql`), database `ohlcv`:
 | `membership` | Symbol registry — **never deleted** |
 | `universe_membership` | Symbol ↔ universe with `enter_date` / `exit_date`, delisted reason |
 | `volatility_rolling` | Per-ticker rolling stats — `rolling_sd` (daily log-return std) and `rolling_avg_volume`, one row per symbol, both used by Layer 4 |
-| `failed_ingestion` | Dead-letter queue — symbols for which **no usable bar** could be obtained (Layers 1–3 only). `failure_mode` (`HTTP_ERROR` \| `VALIDATION`), `attempts`, `review_required`. **Current-state, one row per symbol** (unique on `symbol_id`); the row is deleted once the symbol reaches the price store |
+| `failed_ingestion` | Dead-letter queue — symbols for which **no usable bar** could be obtained (Layers 1–3 only). `failure` (enum `failure_mode`: `HTTP_ERROR` \| `VALIDATION`), `failure_error`, `attempts`, `review_required` (set at 3 attempts). **Current-state, one row per symbol** (unique on `symbol_id`); the row is deleted once the symbol reaches the price store |
 | `pipeline_run` | Operational audit log — status `RUNNING` \| `SUCCESS` \| `FAILED` \| `PARTIAL` |
 | `ohlcv_flag` | Layer-4 annotations — one row per flagged (symbol, session): which rules tripped, the signed log return / open gap and volume, and the **limit each was compared against that day**. The bar itself is always in the price store |
 | `schwab_token` | Durable Schwab refresh token — one row per provider (`UNIQUE`), `issued_at` anchors the 7-day expiry wall |
@@ -201,37 +202,52 @@ Highlights: a partial unique index enforces one active membership per symbol per
 
 ## Pipelines
 
-### `universe_maintenance` (weekly)
-Keeps Russell 3000 membership current. Reads the universe CSV, normalizes symbols to
-slash notation (`BRK.B → BRK/B` — `_sanitize_symbol` replaces every non-alphanumeric
-character with `/`), diffs against active DB membership, upserts new symbols, and
-**soft-deletes** delistings by setting `exit_date` — preserving history for survivorship-
-bias correctness.
+### `universe_maintenance` (weekly, Sundays 00:00 UTC)
+Keeps Russell 3000 membership current. Reads `stock_csv/tickers.csv` (columns
+`ticker,universe`, where `universe` is the `universe.id` UUID), normalizes symbols to
+slash notation (`BRK.B → BRK/B` — `_sanitize_symbol` replaces every character that is
+not a letter, digit or whitespace with `/`), diffs against active DB membership, upserts
+new symbols, and **soft-deletes** delistings by setting `exit_date` — preserving history
+for survivorship-bias correctness. The CSV is the source of truth: an active symbol that
+is missing from it is treated as delisted on the next run.
 
 ### `market_data_pipeline` (06:30 UTC, Tue–Sat — after each US trading day)
-Nine tasks, with `fetch_ohlcv` fanned out via dynamic task mapping for concurrent chunks:
+Nine tasks, with `fetch_ohlcv` fanned out via dynamic task mapping over chunks of 100
+symbols:
 
 ```
 log_pipeline_start → query_active_symbols → build_chunks
         → fetch_ohlcv (mapped per chunk)        # rate-limited Schwab fetch + validation 1–3
         → aggregate_results                      # flatten the mapped chunk results
         → statistical_validation                 # layer 4: flag abnormal bars, keep them all
-        → write_to_delta_lake                    # build frame, dedup, year-partitioned merge
+        → write_to_delta_lake                    # dedup, year-partitioned merge, clear DLQ rows
         → update_volatility                      # recompute rolling stats → PostgreSQL
         → log_pipeline_end                       # SUCCESS / PARTIAL / FAILED
 ```
 
+Each fetch asks `/pricehistory` for one year of daily candles and keeps only the newest
+one. The schedule sits well after the close because Schwab publishes a session's daily
+bar some hours later: a run at ~01:20 UTC still saw the previous session as newest and
+failed Layer 1 for every symbol. `update_volatility` is skipped when nothing was
+written, and `log_pipeline_end` runs even when upstream tasks fail (`all_done`), so
+every run is closed out in `pipeline_run`.
+
 A DAG-level `on_failure_callback` marks the run `FAILED`. Symbols that fail fetch or
 validation are written to the `failed_ingestion` dead-letter queue rather than silently
 dropped, and their rows are deleted once the symbol next reaches the price store.
+Failures that are not about one symbol — an expired refresh token, a failed token
+refresh, or an unreachable rate limiter — abort the whole chunk task instead, since
+retrying the next symbol cannot succeed either.
 
 There is deliberately **no separate retry list**: the pipeline fetches the whole active
 universe every run, so a symbol that fails today is refetched tomorrow as a matter of
 course — today's run *is* the retry. `failed_ingestion` is therefore a monitoring
 surface ("what is broken right now, and for how many runs"), not an input to the fetch
 list. `log_pipeline_end` derives run status from symbols *attempted* versus rows
-*written*, never from the DLQ count — a DLQ that cannot accept writes would otherwise
-report a clean run.
+*written*: `SUCCESS` only when every attempted symbol was written, `PARTIAL` when any is
+missing (or the DLQ logged a failure), `FAILED` when nothing was written. The DLQ count
+can downgrade a run but never vouch for one — a DLQ that cannot accept writes reads as
+zero failures, and would otherwise report a clean run.
 
 Every Schwab call (retries included) first acquires a token from a shared Redis token
 bucket, so all mapped tasks together stay on one metered drip (~109 calls/min → ~27 min
@@ -241,7 +257,7 @@ DLQ instead of being hammered further.
 
 ### `delta_maintenance` (every 25 days)
 Two tasks, strictly ordered: `OPTIMIZE` (bin-packing compaction of the small files the
-daily appends create) then `VACUUM` (physical deletion of tombstoned files older than the
+daily merges create) then `VACUUM` (physical deletion of tombstoned files older than the
 168-hour retention window). Retention is a time-travel / in-flight-reader safety window,
 not a business data-retention knob — `VACUUM` never touches the current table version,
 so the 20-day volatility lookback is unaffected.
@@ -265,7 +281,7 @@ Layers 1–3 decide whether a response **is a bar at all**; Layer 4 records whet
 
 | Layer | Check | On failure |
 |-------|-------|-----------|
-| 1 — HTTP | Status 200, non-empty body, candle date == last NYSE session | Raise / DLQ |
+| 1 — HTTP | Status 200, non-empty candles, newest candle date == last NYSE session before today (UTC) | DLQ (`HTTP_ERROR`; wrong date → `VALIDATION`) |
 | 2 — Fields | `open/high/low/close/volume` present and positive | DLQ (`VALIDATION`) |
 | 3 — Consistency | `high ≥ open,close,low` and `low ≤ open,close` | DLQ (`VALIDATION`) |
 | 4 — Statistical | 5σ log return, 3σ open-vs-prev-close gap, 10× volume spike | **Bar kept**; row in `ohlcv_flag` |
@@ -288,14 +304,16 @@ Layer 4 uses each ticker's **daily** log-return standard deviation (`rolling_sd`
 deliberately *not* annualized. Both the return and the gap are measured as **log ratios**,
 matching `rolling_sd`'s units: comparing a dollar difference against a dimensionless
 standard deviation is a units error that would flag most of the universe (when Layer 4
-still rejected, it silently dropped 80% of it).
+still rejected, it silently dropped about 85% of it).
 
 The volume multiple (10×) is deliberately loose — this flags suspected bad ticks, and earnings
 or index rebalances routinely run 3–5× without the price data being wrong.
 
 A symbol with no rolling baseline yet (a recent listing, or the first run for that ticker)
 has **no** statistical check applied. Those records are written, but counted separately as
-`unvalidated_count` so a run cannot report a clean bill of health it never earned.
+`unvalidated_count` so a run cannot report a clean bill of health it never earned. The
+return and gap checks also need a stored previous close; the volume check does not, so a
+symbol with rolling stats but no previous close still gets that one.
 
 ---
 
@@ -334,18 +352,60 @@ docker-compose up -d    # data plane + Airflow (first boot: airflow-init migrate
                         # the metadata DB and creates the web UI admin user)
 ```
 
-### 4. Database schema
+### 4. Database schema (first boot only)
 
 ```bash
+set -a; source .env; set +a             # DB_USER / DB_DB into this shell
 docker exec -i financial-data-lake-ohlcv-db-1 \
   psql -U "$DB_USER" -d "$DB_DB" < database_init.sql
 ```
+
+The script is for an empty database: `CREATE TYPE`, the triggers and some indexes have
+no `IF NOT EXISTS`, so a second run errors. There is no migration tool yet — later schema
+changes are applied by hand.
 
 ### 5. Delta Lake bucket (one-time)
 
 ```bash
 bash scripts/create_bucket.sh           # provisions s3://ohlcv in LocalStack
 ```
+
+The script runs `awslocal` inside a container named `localstack`. `DELTA_BUCKET`
+overrides the bucket name — keep it in step with `DELTA_TABLE_URI`.
+
+### 6. Universe seed
+
+`database_init.sql` creates no universe rows, and the real ticker list is gitignored.
+Register the universe, then build `stock_csv/tickers.csv` in the same shape as
+[`stock_csv/tickers_sample.csv`](stock_csv/tickers_sample.csv), with the returned id in
+the `universe` column:
+
+```sql
+INSERT INTO universe (name) VALUES ('Russell 3000') RETURNING id;
+```
+
+```
+ticker,universe
+AAPL,<universe id from above>
+BRK.B,<universe id from above>
+```
+
+### 7. Schwab refresh token
+
+The pipeline reads the refresh token from the `schwab_token` table; it never writes it.
+The browser login that produces a token (Schwab's OAuth authorization-code flow) is
+**not part of this repo**. Once you have a refresh token, store it — in an interactive
+`psql` session, so the token lands in neither a file nor your shell history:
+
+```sql
+INSERT INTO schwab_token (refresh_token, issued_at)
+VALUES ('<refresh token>', NOW())
+ON CONFLICT (provider) DO UPDATE
+SET refresh_token = EXCLUDED.refresh_token, issued_at = EXCLUDED.issued_at;
+```
+
+`issued_at` starts the 7-day clock. Repeat this every week; once the token passes its
+wall, every chunk aborts with `SchwabAuthExpiredError` until you do.
 
 ---
 
@@ -357,7 +417,7 @@ All configuration is loaded from `.env` by `AppConfig` (`src/config/config.py`).
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DB_USER` / `DB_PASSWORD` / `DB_DB` | PostgreSQL credentials + database | — |
-| `DB_HOSTNAME` | DB host (`ohlcv-db` in-network, `localhost` from host) | `localhost` |
+| `DB_HOSTNAME` | DB host (`ohlcv-db` in-network, `localhost` from host); port is fixed at 5432 | `localhost` |
 | `REDIS_HOST` / `REDIS_PORT` | Redis token cache + lock | `localhost` / `6379` |
 | `SCHWAB_CLIENT_ID` / `SCHWAB_CLIENT_SECRET` | Schwab OAuth client credentials | — |
 | `SCHWAB_BASE_URL` | Schwab API base URL | `https://api.schwabapi.com` |
@@ -392,10 +452,18 @@ DAGs loading from `airflow/dags/`.
 
 Open the web UI at **http://localhost:8080** (login: `_AIRFLOW_WWW_USER_*` from `.env`).
 DAGs are **paused at creation** — unpause them, then trigger `universe_maintenance` once
-to seed membership, followed by `market_data_pipeline`.
+to seed membership (it needs step 6 of Getting Started), followed by
+`market_data_pipeline` (it needs step 7). Avoid triggering a DAG while a run of it is still in flight — see
+[Known Limitations](#known-limitations).
+
+Code changes need no rebuild: the project is bind-mounted, every task runs in a fresh
+process, and the DAG processor re-parses within about two minutes. Rebuild the image
+(`docker-compose build`) only when `airflow/requirements.txt` changes.
 
 For lightweight local iteration you can instead run Airflow standalone on the host
-(using the `localhost` config overrides):
+(using the `localhost` config overrides). `setup.yaml` does **not** install Airflow, so
+install `apache-airflow==3.1.8` into the environment first (with Airflow's constraints
+file):
 
 ```bash
 export AIRFLOW_HOME=$(pwd)/airflow
@@ -416,6 +484,9 @@ s3://ohlcv/prices/
 └── year=2026/
     └── part-*.snappy.parquet   # columnar OHLCV data
 ```
+
+Columns: `symbol` (string), `date` (timestamp, the session date), `open` / `high` /
+`low` / `close` (float64), `volume` (int64), and `year` (int32, the partition key).
 
 Year partitioning (rather than daily) keeps file sizes healthy and avoids the
 small-files problem. Writes are an **idempotent `MERGE` on (symbol, date)**, so a task
@@ -472,6 +543,26 @@ to compact the daily files and reap the resulting tombstones.
 
 ---
 
+## Known Limitations
+
+- **No backfill.** Each fetch keeps only the newest candle, and Layer 1 compares it with
+  the last NYSE session before the *wall-clock* date, not the Airflow logical date.
+  Re-triggering a missed day's run therefore fetches whatever session is newest at that
+  moment; a missed session cannot be recovered by re-running it.
+- **Rolling stats hold only the latest value.** `volatility_rolling` is overwritten
+  nightly. `ohlcv_flag` stores the limit applied on the day, but re-evaluating an old
+  session would compare it with today's stats — information from after that session.
+- **One shared run id.** Tasks read the current run's id from a single Airflow Variable,
+  so two overlapping runs of the same DAG overwrite each other's id. Safe while runs never
+  overlap (`catchup=False`, no manual trigger during a run).
+- **Hand-maintained universe.** `tickers.csv` is updated by hand; an automated import
+  from the iShares IWV holdings file is planned.
+- **Local development only.** Redis has no password and publishes port 6379 on every
+  interface, and Airflow's metadata DB uses `airflow`/`airflow`. Do not run this stack on
+  a shared or public network as-is.
+
+---
+
 ## Roadmap
 
 - [x] PostgreSQL schema, DBClient, UniverseService, universe-maintenance DAG
@@ -482,7 +573,10 @@ to compact the daily files and reap the resulting tombstones.
 - [x] `delta_maintenance` DAG — periodic `OPTIMIZE` + `VACUUM`
 - [x] `xcom_cleanup` DAG — weekly XCom purge via `airflow db clean`
 - [x] First end-to-end run with live Schwab credentials
+- [x] Layer 4 as annotation (`ohlcv_flag`) instead of rejection
 - [ ] Automated test suite (framework not yet chosen — see [Testing](#testing))
+- [ ] Backfill of missed sessions (see [Known Limitations](#known-limitations))
+- [ ] Automated universe refresh from the iShares IWV holdings file
 - [ ] Point-in-time correctness / historical constituent snapshots (later phase)
 
 ---
