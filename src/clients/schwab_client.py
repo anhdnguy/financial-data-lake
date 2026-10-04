@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 
 class SchwabClient:
     # 1 initial attempt + 3 backoff retries per symbol. A symbol still throttled
-    # after that goes to the DLQ (SchwabHTTPError) with retry_after NOW()+1h —
-    # persistent 429s mean back off for real, not hammer harder.
+    # after that goes to the DLQ (SchwabHTTPError) and is refetched on the next
+    # daily run — persistent 429s mean back off for real, not hammer harder.
     _MAX_ATTEMPTS = 4
     _BACKOFF_BASE_SECONDS = 2.0
     _BACKOFF_CAP_SECONDS = 60.0
@@ -104,7 +104,8 @@ class SchwabClient:
 
         candle = data["candles"][-1]
 
-        # Layer 1 — Date matches today UTC
+        # Layer 1 — Candle is the last NYSE session before today (UTC wall clock,
+        # not the Airflow logical date)
         candle_date = datetime.fromtimestamp(
             candle["datetime"] / 1000, tz=timezone.utc
         ).date()

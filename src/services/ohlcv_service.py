@@ -392,10 +392,11 @@ class OHLCVService:
         """
         Drop DLQ rows for symbols that just landed in the price store.
 
-        failed_ingestion is current-state ("what needs retrying now"), not history, so a
+        failed_ingestion is current-state ("what is broken right now"), not history, so a
         resolved failure is deleted outright rather than marked. Without this, `attempts`
         only ever climbs: three unrelated transient failures months apart would latch
-        review_required and drop a healthy symbol from the retry list permanently.
+        review_required on a healthy symbol and send someone to investigate a problem
+        that no longer exists.
         """
         if not symbols:
             return
@@ -458,9 +459,10 @@ class OHLCVService:
             raise PipelineStorageError("Delta Lake write failed") from e
 
         # Only now are these symbols genuinely resolved: the data is in the price store.
-        # Clearing at fetch time would be wrong — a record can pass fetch and still be
-        # flagged by Layer 4 afterwards. Safe to retry if this raises: s3.write is an
-        # idempotent MERGE, so a re-run rewrites the same rows.
+        # Clearing at fetch time would be premature — a fetched record can still fail to
+        # land (the Layer-4 flag write or this Delta write can raise), and its DLQ row
+        # would already be gone. Safe to retry if this raises: s3.write is an idempotent
+        # MERGE, so a re-run rewrites the same rows.
         self._clear_resolved_failures(df["symbol"].tolist())
         return rows_written
 
